@@ -117,7 +117,7 @@ struct Flash_fwd_params : public Qkv_params {
     int * __restrict__ kv_batch_idx;
 
     // Paged KV cache
-    int * __restrict__ page_table;
+    int * __restrict__ page_table = nullptr;
     index_t page_table_batch_stride;
     int page_size;
     int num_pages;
@@ -157,6 +157,30 @@ struct Flash_fwd_params : public Qkv_params {
 
     int arch;
     int num_sm;
+
+    // FlashMask
+    int h_flashmask;
+    int h_h_flashmask_ratio;
+    
+    int32_t * __restrict__ lt_start_ptr = nullptr;
+    int32_t * __restrict__ lt_end_ptr = nullptr;
+    
+    int32_t * __restrict__ ut_start_ptr = nullptr;
+    int32_t * __restrict__ ut_end_ptr = nullptr;
+    
+    int32_t * __restrict__ flashmask_maxmin_ptr = nullptr;
+    
+    int32_t * __restrict__ lt_start_nblockmax = nullptr;
+    int32_t * __restrict__ lt_start_nblockmin = nullptr;
+    
+    int32_t * __restrict__ lt_end_nblockmax = nullptr;
+    int32_t * __restrict__ lt_end_nblockmin = nullptr;
+    
+    int32_t * __restrict__ ut_start_nblockmax = nullptr;
+    int32_t * __restrict__ ut_start_nblockmin = nullptr;
+    
+    int32_t * __restrict__ ut_end_nblockmax = nullptr;
+    int32_t * __restrict__ ut_end_nblockmin = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
