@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cuda.h>
+#include "cuda_runtime.h"
 #include <vector>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -157,6 +158,31 @@ struct Flash_fwd_params : public Qkv_params {
 
     int arch;
     int num_sm;
+
+    // FlashMask
+    int h_flashmask;
+    int h_h_flashmask_ratio;
+    int flashmask_maxmin_masklen;
+    
+    int32_t * __restrict__ lt_start_ptr = nullptr;
+    int32_t * __restrict__ lt_end_ptr = nullptr;
+    
+    int32_t * __restrict__ ut_start_ptr = nullptr;
+    int32_t * __restrict__ ut_end_ptr = nullptr;
+    
+    int32_t * __restrict__ flashmask_maxmin_ptr = nullptr;
+    
+    int32_t * __restrict__ lt_start_nblockmax = nullptr;
+    int32_t * __restrict__ lt_start_nblockmin = nullptr;
+    
+    int32_t * __restrict__ lt_end_nblockmax = nullptr;
+    int32_t * __restrict__ lt_end_nblockmin = nullptr;
+    
+    int32_t * __restrict__ ut_start_nblockmax = nullptr;
+    int32_t * __restrict__ ut_start_nblockmin = nullptr;
+    
+    int32_t * __restrict__ ut_end_nblockmax = nullptr;
+    int32_t * __restrict__ ut_end_nblockmin = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

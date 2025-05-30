@@ -81,12 +81,15 @@ public:
             alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_KV;
             alignas(16) typename CollectiveMainloop::MainloopPipeline::SharedStorage pipeline_q;
             alignas(16) typename CollectiveMainloop::MainloopPipeline_dO::SharedStorage pipeline_do;
+            // alignas(16) typename CollectiveMainloop::MainloopPipeline_flashmask::SharedStorage pipeline_flashmask;
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
 
     };
 
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
+    // static constexpr int TensorStorageSize = sizeof(SharedStorage::tensors);
+    // static constexpr int PipelineStorageSize = sizeof(SharedStorage::pipelines);
 
     // Device side arguments
     struct Arguments {
@@ -159,10 +162,14 @@ public:
         using MainloopPipeline_dO = typename CollectiveMainloop::MainloopPipeline_dO;
         using PipelineParams_dO = typename MainloopPipeline_dO::Params;
         using PipelineState_dO = typename MainloopPipeline_dO::PipelineState;
+        // using MainloopPipeline_flashmask = typename CollectiveMainloop::MainloopPipeline_flashmask;
+        // using PipelineParams_flashmask = typename MainloopPipeline_flashmask::Params;
+        // using PipelineState_flashmask = typename MainloopPipeline_flashmask::PipelineState;
         static constexpr bool Q_dO_same_stages = std::is_same_v<MainloopPipeline, MainloopPipeline_dO>;
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
+        // int32_t * flashmask_smem_ = nullptr;
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
 
@@ -174,6 +181,7 @@ public:
 
         // Obtain warp index
         int const warp_group_thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
+        // printf("enter");
 
         PipelineParams pipeline_params;
         pipeline_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytesQ + CollectiveMainloop::TmaTransactionBytesLSE;
@@ -195,8 +203,17 @@ public:
         PipelineParams_dO pipeline_params_dO {pipeline_params.transaction_bytes, role_dO, pipeline_params.is_leader, pipeline_params.num_consumers};
         MainloopPipeline_dO pipeline_do(shared_storage.pipelines.pipeline_do, cute::conditional_return<Q_dO_same_stages>(pipeline_params, pipeline_params_dO), ClusterShape{});
 
+        // PipelineParams_flashmask pipeline_params_flashmask;
+        // pipeline_params_flashmask.role = warp_group_idx == 0
+        //     ? MainloopPipeline_flashmask::ThreadCategory::Producer
+        //     : MainloopPipeline_flashmask::ThreadCategory::Consumer;
+        // pipeline_params_flashmask.consumer_arv_count = NumMmaThreads + 32; //store_dp and mma
+        // MainloopPipeline_flashmask pipeline_flashmask(shared_storage.pipelines.pipeline_flashmask, pipeline_params_flashmask);
+
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
+        __shared__ __align__(16) int32_t flashmask_smem_[8];
+        __shared__ __align__(128) int32_t flashmask_index_smem_[kBlockN * 4];
 
         // We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
         if constexpr (size(ClusterShape{}) > 1) {
@@ -210,6 +227,10 @@ public:
 
         if (warp_group_idx == 0) {  // Producer
             cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+            // if(threadIdx.x == 0){
+            //     int producer_num = LoadRegisterRequirement;
+            //     printf("producer_num = %d\n", producer_num);
+            // }
 
             int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
             if (warp_idx_in_warpgroup == 0) {  // Load K, V, and do TMA on Q and dO
@@ -224,8 +245,10 @@ public:
                     auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
                         scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                     };
+                    mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
                     mainloop.load(params.mainloop, pipeline_q, pipeline_do, smem_pipe_write,
-                                  smem_pipe_write_do, shared_storage, scheduler_prefetch, block_coord);
+                                  smem_pipe_write_do, shared_storage, scheduler_prefetch, block_coord,flashmask_smem_);
+                    // mainloop.wait_for_load_n_block_info();
                 }
                 mainloop.load_tail(pipeline_q, pipeline_do, smem_pipe_write, smem_pipe_write_do);
             } else if (warp_idx_in_warpgroup == 1) {
@@ -235,12 +258,28 @@ public:
                     auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
                     auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
                     cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                    mainloop.store_dq(params.mainloop, shared_storage, block_coord);
+                    mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
+                    mainloop.store_dq(params.mainloop, shared_storage, block_coord,flashmask_smem_);
+                    mainloop.wait_for_load_n_block_info();
+                }
+            }else{
+                for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
+                     work_tile_info.is_valid(params.scheduler);
+                     work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
+                    auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
+                    auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
+                    cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
+                    mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
+                    mainloop.wait_for_load_n_block_info();
                 }
             }
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
             // Initialize matmul objects.
+            // if(cute::elect_one_sync()){
+            //     int mma_num = MmaRegisterRequirement;
+            //     printf("mma_num = %d\n", mma_num);
+            // }
             TiledMmadKV tiled_mma_dKV;
 
             PipelineState smem_pipe_read;
@@ -261,16 +300,17 @@ public:
                 // dK and dV output accumulator.
                 Tensor tdKrdK = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
                 Tensor tdVrdV = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
+                mainloop.wait_for_load_n_block_info();
                 bool tile_valid = mainloop.mma(
                     params.mainloop, pipeline_q, pipeline_do, smem_pipe_read, smem_pipe_read_do,
-                    tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage);
+                    tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage,flashmask_smem_, flashmask_index_smem_);
                 if (tile_valid) {
                     epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
                                    threadIdx.x - NumCopyThreads, block_coord);
                 } else {
                     epilogue.store_zero(params.epilogue, threadIdx.x - NumCopyThreads, block_coord);
                 }
-
+                mainloop.wait_for_load_n_block_info();
             }
             epilogue.store_tail();
         }
