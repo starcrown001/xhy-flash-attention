@@ -28,11 +28,12 @@ template <int Arch, int kHeadDim, int kBlockM, int kBlockN, typename Element,
           int Stages_dO=2, int Stages_dS_or_QSm80=2,
           bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
           int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-          bool V_in_regs=false>
+          bool V_in_regs=false, bool Is_flashmask>
 void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Is_causal and Is_local cannot be true at the same time.");
     using ElementAccum = float;
     using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
+    // std::cout << "kblockM: " << kBlockM << ", kblockN: " << kBlockN << ",is_causal: "<<Is_causal << std::endl;
 
     int const total_q_padded_rounded = cute::round_up(params.total_q + params.b * kBlockM, kBlockM);
     int const total_k_padded_rounded = cute::round_up(params.total_k + params.b * kBlockN, kBlockN);
@@ -83,7 +84,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         Arch >= 90,
         flash::CollectiveMainloopBwdSm90<Stages, Stages_dO, Stages_dS, ClusterShape, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm90,
             Is_causal, Is_local, Has_softcap, Varlen, Deterministic,
-            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>,
+            SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Is_flashmask>,
         flash::CollectiveMainloopBwdSm80<Stages, Stages_dO, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm80,
             Is_causal, Is_local, Has_softcap, Varlen, Deterministic,
             SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>
@@ -100,33 +101,75 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         flash::enable_sm80_to_sm89<flash::FlashAttnBwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
 
-    typename CollectiveMainloop::Arguments mainloop_args {
-        static_cast<Element const*>(params.q_ptr),
-        {seqlen_q, params.d, params.h, batch_q},  // shape_Q
-        {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},  // stride_Q
-        static_cast<Element const*>(params.k_ptr),
-        {seqlen_k, params.d, params.h_k, batch_k},  // shape_K
-        {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0},  // stride_K
-        static_cast<Element const*>(params.v_ptr),
-        {params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0},  // stride_V
-        static_cast<Element const*>(params.do_ptr),
-        {params.do_row_stride, _1{}, params.do_head_stride, !is_varlen_q ? params.do_batch_stride : 0},  // stride_dO
-        static_cast<ElementAccum*>(params.dq_accum_ptr),
-        {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
-        {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
-        static_cast<float*>(params.softmax_lse_log2_ptr),
-        {seqlen_q_rounded, params.h, batch_q},  // shape_LSE
-        {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
-        static_cast<float*>(params.dsoftmax_sum),
-        {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
-        params.scale_softmax,
-        params.window_size_left, params.window_size_right,
-        params.softcap,
-        params.b,
-        params.dq_semaphore,
-        params.cu_seqlens_q, params.cu_seqlens_k,
-        params.seqused_q, params.seqused_k
-    };
+    if constexpr (Is_flashmask) {
+        flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream);
+    }
+
+    typename CollectiveMainloop::Arguments mainloop_args = [&] () {
+        if constexpr(Arch >= 90)
+            return typename CollectiveMainloop::Arguments {
+                static_cast<Element const*>(params.q_ptr),
+                {seqlen_q, params.d, params.h, batch_q},  // shape_Q
+                {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},  // stride_Q
+                static_cast<Element const*>(params.k_ptr),
+                {seqlen_k, params.d, params.h_k, batch_k},  // shape_K
+                {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0},  // stride_K
+                static_cast<Element const*>(params.v_ptr),
+                {params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0},  // stride_V
+                static_cast<Element const*>(params.do_ptr),
+                {params.do_row_stride, _1{}, params.do_head_stride, !is_varlen_q ? params.do_batch_stride : 0},  // stride_dO
+                static_cast<ElementAccum*>(params.dq_accum_ptr),
+                {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
+                {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
+                static_cast<float*>(params.softmax_lse_log2_ptr),
+                {seqlen_q_rounded, params.h, batch_q},  // shape_LSE
+                {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
+                static_cast<float*>(params.dsoftmax_sum),
+                {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
+                params.scale_softmax,
+                params.window_size_left, params.window_size_right,
+                params.softcap,
+                params.b,
+                params.dq_semaphore,
+                params.cu_seqlens_q, params.cu_seqlens_k,
+                params.seqused_q, params.seqused_k,
+                params.h_flashmask, params.h_h_flashmask_ratio,
+                params.lt_start_ptr, params.lt_end_ptr,
+                params.ut_start_ptr, params.ut_end_ptr,
+                params.flashmask_maxmin_ptr,
+                params.lt_start_nblockmax, params.lt_start_nblockmin,
+                params.lt_end_nblockmax, params.lt_end_nblockmin,
+                params.ut_start_nblockmax, params.ut_start_nblockmin,
+                params.ut_end_nblockmax, params.ut_end_nblockmin
+            };
+        else
+            return typename CollectiveMainloop::Arguments {
+                static_cast<Element const*>(params.q_ptr),
+                {seqlen_q, params.d, params.h, batch_q},  // shape_Q
+                {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},  // stride_Q
+                static_cast<Element const*>(params.k_ptr),
+                {seqlen_k, params.d, params.h_k, batch_k},  // shape_K
+                {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0},  // stride_K
+                static_cast<Element const*>(params.v_ptr),
+                {params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0},  // stride_V
+                static_cast<Element const*>(params.do_ptr),
+                {params.do_row_stride, _1{}, params.do_head_stride, !is_varlen_q ? params.do_batch_stride : 0},  // stride_dO
+                static_cast<ElementAccum*>(params.dq_accum_ptr),
+                {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
+                {_1{}, seqlen_q_rounded * params.d_rounded, !is_varlen_q ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
+                static_cast<float*>(params.softmax_lse_log2_ptr),
+                {seqlen_q_rounded, params.h, batch_q},  // shape_LSE
+                {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
+                static_cast<float*>(params.dsoftmax_sum),
+                {_1{}, seqlen_q_rounded, !is_varlen_q ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
+                params.scale_softmax,
+                params.window_size_left, params.window_size_right,
+                params.softcap,
+                params.b,
+                params.dq_semaphore,
+                params.cu_seqlens_q, params.cu_seqlens_k,
+                params.seqused_q, params.seqused_k};
+            }();        
     // The case work with GQA is ugly but idk how to fix it.
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<typename CollectiveEpilogue::Element*>(!GQA ? params.dk_ptr : params.dk_accum_ptr),
@@ -290,8 +333,10 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
         BOOL_SWITCH(params.h != params.h_k, GQA, [&] {
 //             BOOL_SWITCH(params.deterministic, Deterministic, [&] {
             // run_flash_bwd<kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen, false, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);
-            run_flash_bwd<Arch, kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen /*Varlen*/, false /*Deterministic*/, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>(params, stream);
+            BOOL_SWITCH(params.lt_start_ptr != nullptr, Is_flashmask_, [&] {     
+                run_flash_bwd<Arch, kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen /*Varlen*/, false /*Deterministic*/, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, Is_flashmask_>(params, stream);
 //             });
+            });
         });
     });
 }
@@ -299,7 +344,7 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
 
 template<int Arch, typename T, bool Has_softcap>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
-    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
+    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {        
         if constexpr (Arch >= 90) {
             if constexpr (Is_causal && Has_softcap) {
                 // register spill with 128 x 128
