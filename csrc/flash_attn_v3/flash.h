@@ -162,6 +162,7 @@ struct Flash_fwd_params : public Qkv_params {
     // FlashMask
     int h_flashmask;
     int h_h_flashmask_ratio;
+    int flashmask_maxmin_masklen;
     
     int32_t * __restrict__ lt_start_ptr = nullptr;
     int32_t * __restrict__ lt_end_ptr = nullptr;

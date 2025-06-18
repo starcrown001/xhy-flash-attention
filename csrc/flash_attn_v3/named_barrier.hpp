@@ -76,6 +76,7 @@ enum class BwdNamedBarriers {
     dQFullWG1 = 7,
     dQFullWG2 = 8,
     dQFullWG3 = 9,
+    Flashmask = 0, //HACK: KVEmpty sync is unused
 };
 
 } // flash
