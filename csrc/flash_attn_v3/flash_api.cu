@@ -128,7 +128,6 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             if (params.d <= 256) { return run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
                             #endif
                             #else
-                            PADDLE_CHECK(false, "This flash attention build does not support FP8.");
                             #endif
                         }
                     });
@@ -231,6 +230,7 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         //         run_mha_bwd_<elem_type, kHeadDim>(params, stream);
         //     });
         // });
+    // printf("params.d = %d",params.d);
     ARCH_SWITCH(params.arch, Arch, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
             if (!params.is_bf16) {
@@ -269,6 +269,7 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
                 #ifndef FLASHATTENTION_DISABLE_HDIM256
                 if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap>(params, stream); }
                 #endif
+                PADDLE_CHECK(false, "This flash attention build does not support ");
             }
         });
     });
@@ -329,6 +330,7 @@ void fa3_run_mha_fwd(Flash_fwd_params* params_handle, cudaStream_t stream) {
 }
 
 void fa3_run_mha_bwd(Flash_bwd_params* params_handle, cudaStream_t stream) {
+    // printf("point1\n");
     run_mha_bwd(*params_handle, stream);
 }
 

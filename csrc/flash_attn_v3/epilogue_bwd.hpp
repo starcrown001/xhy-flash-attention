@@ -145,6 +145,8 @@ struct CollectiveEpilogueBwd {
                 return nullptr;
             }
         }();
+        // print("tma_dv:\n");
+        // cute::print(tma_store_dV);
         return {args.ptr_dK, args.shape_dK, args.stride_dK, args.ptr_dV, args.stride_dV,
                 tma_store_dK, tma_store_dV, args.cu_seqlens, args.seqused};
     }
@@ -191,7 +193,7 @@ struct CollectiveEpilogueBwd {
         flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
         cute::copy(smem_tiled_copy_dKV, taccdVrdV, taccdVsdV);
         cute::copy(smem_tiled_copy_dKV, taccdKrdK, taccdKsdK);
-        if constexpr (Use_TMA) {
+        if constexpr (Use_TMA ) {
             cutlass::arch::fence_view_async_shared(); // ensure smem writes are visible to TMA
             cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
                                                 cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
@@ -207,6 +209,11 @@ struct CollectiveEpilogueBwd {
             Tensor tdVgdV = block_tma_dV.partition_D(gdV);  // (TMA, TMA_M, TMA_K)
             Tensor tdVsdV = block_tma_dV.partition_S(sdV); // (TMA, TMA_M, TMA_K)
             int warp_idx_sync = __shfl_sync(0xffffffff, thread_idx / cutlass::NumThreadsPerWarp, 0);
+            // if (blockIdx.x == 0 && threadIdx.x == 128) {
+            //         printf("sdV:\n");
+            //         // cute::print(block_tma_dV);
+            //         cute::print_tensor(sdV);
+            // }                                                
             if (warp_idx_sync == NumEpilogueThreads / cutlass::NumThreadsPerWarp - 1) {
                 cutlass::arch::NamedBarrier::sync(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
                                                 cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
@@ -217,6 +224,16 @@ struct CollectiveEpilogueBwd {
                 }
             }
             tma_store_wait<0>();
+            // if (blockIdx.x == 0 && threadIdx.x == 128) {
+            //     printf("gdv:\n");
+            //     cute::print_tensor(tdVgdV);
+            //     // cute::print_tensor(gdV); 
+            // }
+            // if (blockIdx.x == 0 && threadIdx.x == 128) {
+            //     Tensor mdV1 = make_tensor(make_gmem_ptr(params.ptr_dV), params.shape_dK, params.stride_dV)(_, _, bidh, 0);
+            //     printf("mdv:\n");
+            //     cute::print_tensor(mdV1);
+            // }
             // // Tell warp 0 that smem_k and smem_v are ready
             // cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
 

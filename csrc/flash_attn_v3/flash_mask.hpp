@@ -2,187 +2,57 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include "utils.h"
 
 namespace flash {
 
-template <int kBlockM, int kBlockN, int kStages>
-class FlashMask {
-#if 0
-  bool partially_masked;
-  using index_t = uint32_t;
-  int32_t const n_block_min;
-  int32_t n_block;
-  int32_t const m_block;
-
-  index_t const row_offset_flash_mask;
-  index_t const row_offset_flash_mask_nblock;
-
-  int32_t* const s_lt_start = nullptr;
-  int32_t* const s_lt_end = nullptr;
-  int32_t* const s_ut_start = nullptr;
-  int32_t* const s_ut_end = nullptr;
-
-  int32_t* const g_lt_start;
-  int32_t* const g_lt_end;
-  int32_t* const g_lt_start_max;
-  int32_t* const g_lt_start_min;
-  int32_t* const g_lt_end_max;
-  int32_t* const g_lt_end_min;
-
-  int32_t* const g_ut_start;
-  int32_t* const g_ut_end;
-  int32_t* const g_ut_start_max;
-  int32_t* const g_ut_start_min;
-  int32_t* const g_ut_end_max;
-  int32_t* const g_ut_end_min;
-
-  struct Params {
-    int32_t* const smem;
-    int const m_block;
-    int const bidh;
-    int const bidb;
-    int32_t const n_block_max;
-    int32_t const n_block_min;
-
-    int32_t const seqlen_k;
-
-    // FlashMask
-    int const h_flashmask;
-    int const h_h_flashmask_ratio;
-    
-    int32_t * __restrict__ const lt_start_ptr = nullptr;
-    int32_t * __restrict__ const lt_end_ptr = nullptr;
-    
-    int32_t * __restrict__ const ut_start_ptr = nullptr;
-    int32_t * __restrict__ const ut_end_ptr = nullptr;
-    
-    int32_t * __restrict__ const flashmask_maxmin_ptr = nullptr;
-    
-    int32_t * __restrict__ const lt_start_nblockmax = nullptr;
-    int32_t * __restrict__ const lt_start_nblockmin = nullptr;
-    
-    int32_t * __restrict__ const lt_end_nblockmax = nullptr;
-    int32_t * __restrict__ const lt_end_nblockmin = nullptr;
-    
-    int32_t * __restrict__ const ut_start_nblockmax = nullptr;
-    int32_t * __restrict__ const ut_start_nblockmin = nullptr;
-    
-    int32_t * __restrict__ const ut_end_nblockmax = nullptr;
-    int32_t * __restrict__ const ut_end_nblockmin = nullptr;
-  };
-
-public:
+  template <typename TiledMma,int kBlockM, int kBlockN,bool SwapAB, typename Engine, typename Layout>
   CUTLASS_DEVICE
-  FlashMask(Params params) :
-    n_block_min(params.n_block_min),
-    n_block(params.n_block_max),
-    m_block(params.m_block),
-
-    row_offset_flash_mask((params.bidb * params.h_flashmask + params.bidh / params.h_h_flashmask_ratio) * params.seqlen_k),
-    row_offset_flash_mask_nblock((params.bidb * params.h_flashmask + params.bidh / params.h_h_flashmask_ratio) * cute::ceil_div(params.seqlen_k, kBlockN)),
-
-    s_lt_start(params.smem),
-    s_lt_end(params.smem + kBlockN * kStages),
-    s_ut_start(params.smem + 2 * kBlockN * kStages),
-    s_ut_end(params.smem + 3 * kBlockN * kStages),
-
-    g_lt_start(params.lt_start_ptr == nullptr ? nullptr : params.lt_start_ptr + row_offset_flash_mask),
-    g_lt_end(params.lt_end_ptr == nullptr ? nullptr : params.lt_end_ptr + row_offset_flash_mask),
-    g_lt_start_max(params.lt_start_nblockmax + row_offset_flash_mask_nblock),
-    g_lt_start_min(params.lt_start_nblockmin + row_offset_flash_mask_nblock),
-    g_lt_end_max(params.lt_end_nblockmax + row_offset_flash_mask_nblock),
-    g_lt_end_min(params.lt_end_nblockmin + row_offset_flash_mask_nblock),
-
-    g_ut_start(params.ut_start_ptr == nullptr ? nullptr : params.ut_start_ptr + row_offset_flash_mask),
-    g_ut_end(params.ut_end_ptr == nullptr ? nullptr : params.ut_end_ptr + row_offset_flash_mask),
-    g_ut_start_max(params.ut_start_nblockmax + row_offset_flash_mask_nblock),
-    g_ut_start_min(params.ut_start_nblockmin + row_offset_flash_mask_nblock),
-    g_ut_end_max(params.ut_end_nblockmax + row_offset_flash_mask_nblock),
-    g_ut_end_min(params.ut_end_nblockmin + row_offset_flash_mask_nblock) {}
-
-  CUTLASS_DEVICE
-  int32_t get_n_block(int32_t n_block_min) {
-    for(n_block--; n_block >= n_block_min; n_block--) {
-        // TODO(umiswing): optimize gmem read? although a broadcast should be performed
-        int32_t lt_start_max = g_lt_start_max == nullptr ? INT_MAX : g_lt_start_max[n_block];
-        int32_t lt_start_min = g_lt_start_min == nullptr ? INT_MAX : g_lt_start_min[n_block];
-
-        int32_t lt_end_max = g_lt_end_max == nullptr ? INT_MAX : g_lt_end_max[n_block];
-        int32_t lt_end_min = g_lt_end_min == nullptr ? INT_MAX : g_lt_end_min[n_block];
-
-        int32_t ut_start_max = g_ut_start_max == nullptr ? INT_MAX : g_ut_start_max[n_block];
-        int32_t ut_start_min = g_ut_start_min == nullptr ? INT_MAX : g_ut_start_min[n_block];
-
-        int32_t ut_end_max = g_ut_end_max == nullptr ? INT_MAX : g_ut_end_max[n_block];
-        int32_t ut_end_min = g_ut_end_min == nullptr ? INT_MAX : g_ut_end_min[n_block];
-
-        if(m_block * kBlockM >= lt_start_max && (m_block + 1) * kBlockM <= lt_end_min)
-            continue;
-        if(m_block * kBlockM >= ut_start_max && (m_block + 1) * kBlockM <= ut_end_min)
-            continue;
-        if(m_block * kBlockM < lt_end_max && (m_block + 1) * kBlockM > lt_start_min)
-            partially_masked = true;
-        else if(m_block * kBlockM < ut_end_max && (m_block + 1) * kBlockM > ut_start_min)
-            partially_masked = true;
-        else
-            partially_masked = false;
-        partially_masked = false;
-
-        return n_block;
-    }
-    return n_block_min - 1;
-  }
-
-  CUTLASS_DEVICE
-  void load(int const thread_idx, int const threads_num, int const index) {
-    if(n_block < n_block_min) return;
-    if(!partially_masked) return;
-    #pragma unroll
-    for(int idx = thread_idx; idx < kBlockN; idx += threads_num) {
-      s_lt_start[idx + index * kBlockN] = g_lt_start == nullptr ? INT_MAX : g_lt_start[n_block * kBlockN + idx];
-      s_lt_end[idx + index * kBlockN] = g_lt_end == nullptr ? INT_MAX : g_lt_end[n_block * kBlockN + idx];
-      s_ut_start[idx + index * kBlockN] = g_ut_start == nullptr ? INT_MAX : g_ut_start[n_block * kBlockN + idx];
-      s_ut_end[idx + index * kBlockN] = g_ut_end == nullptr ? INT_MAX : g_ut_end[n_block * kBlockN + idx];
-    }
-    cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMask));
-  }
-
-  template <typename TiledMma, typename Engine, typename Layout>
-  CUTLASS_DEVICE
-  void apply(Tensor<Engine, Layout> &tSrS, int const thread_idx, int const index) {
-      if(n_block < n_block_min) return;
-      if(!partially_masked) return;
+  void apply_flashmask_bwd(Tensor<Engine, Layout> &tSrS, int const thread_idx, int32_t const * flashmask_index_smem_, const int32_t m_block) {
 
       // static_assert(!PackGQA);
       // static_assert(!SwapAB);
 
       auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
 
-      Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+      Tensor cS = cute::make_identity_tensor(Shape<Int<!SwapAB ? kBlockM : kBlockN>, Int<!SwapAB ? kBlockN : kBlockM>>{});
       Tensor tScS = thread_mma.partition_C(cS);
-      Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tSrS.layout()));
-      Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tScS.layout()));
+      Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SwapAB>(tSrS.layout()));
+      Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SwapAB>(tScS.layout()));
 
-      static constexpr int Row = 0, Col = 1;
+      static constexpr int Row = !SwapAB ? 0 : 1, Col = !SwapAB ? 1 : 0;
+      const int32_t * s_lt_start = flashmask_index_smem_;
+      const int32_t * s_lt_end = flashmask_index_smem_ + kBlockN;
+      const int32_t * s_ut_start = flashmask_index_smem_ + 2 * kBlockN;
+      const int32_t * s_ut_end = flashmask_index_smem_ + 3 * kBlockN;
 
       #pragma unroll
       for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
         int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
+        // __syncwarp();
+        // printf("\n>>>>>> wsm debug row_idx:%d, thread_idx:%d\n", row_idx, thread_idx);
+        // __syncwarp();
         #pragma unroll
         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
           int const col_idx = get<Col>(tScS_rowcol(m, n)); // col_idx within a block
-          if(row_idx >= s_lt_start[col_idx + index * kBlockN] && row_idx < s_lt_end[col_idx + index * kBlockN])
+          if(row_idx >= s_lt_start[col_idx] && row_idx < s_lt_end[col_idx]){
               tSrS_rowcol(m, n) = -INFINITY;
-          if(row_idx >= s_ut_start[col_idx + index * kBlockN] && row_idx < s_ut_end[col_idx + index * kBlockN])
+              // printf("point1, row_idx:%d, col_idx:%d, thread_idx:%d, tSrS_rowcol(m, n):%f\n", row_idx, col_idx, thread_idx, tSrS_rowcol(m, n));
+            }
+          if(row_idx >= s_ut_start[col_idx] && row_idx < s_ut_end[col_idx]){
               tSrS_rowcol(m, n) = -INFINITY;
+            //  printf("point2, row_idx:%d, col_idx:%d, thread_idx:%d, tSrS_rowcol(m, n):%f\n", row_idx, col_idx, thread_idx, tSrS_rowcol(m, n));
+          }
+          // printf("\n>>>>>> wsm debug s_ltstart_col :%d, s_ltend_col:%d,s_utstart_col:%d, s_utend_col:%d, col_idx: %d\n", s_lt_start[col_idx], s_lt_end[col_idx], s_ut_start[col_idx], s_ut_end[col_idx], col_idx);
+          // printf("\n>>>>>> wsm debug row_idx:%d, col_idx:%d,m:%d,n:%d, thread_idx:%d, tSrS_rowcol(m, n):%f\n", row_idx, col_idx,m,n, thread_idx, tSrS_rowcol(m, n));
         }
       }
     }
 
-#endif
-};
+// };
 
 namespace flashmask {
+
   template<int kBlockN>
   __global__
   void scanMaxMinKernel(
@@ -192,8 +62,8 @@ namespace flashmask {
       return;
     }
     int i_offset = bid * n;
-    const int o_n = (n + kBlockN - 1) / kBlockN;
     input = input + i_offset;
+    const int o_n = (n + kBlockN - 1) / kBlockN;
     // constexpr int nums = kBlockN / 32;  // ensure N % 32 == 0
     constexpr int nums = (kBlockN + 31) / 32;
     int warpId = blockIdx.x;      // ensure blockDim.x == 32
