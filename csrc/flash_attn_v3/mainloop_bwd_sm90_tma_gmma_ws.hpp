@@ -328,7 +328,6 @@ struct CollectiveMainloopBwdSm90 {
         // FlashMask
         int const h_flashmask;
         int const h_h_flashmask_ratio;
-        int const flashmask_maxmin_masklen;
 
         int32_t * __restrict__ const lt_start_ptr = nullptr;
         int32_t * __restrict__ const lt_end_ptr = nullptr;
@@ -380,7 +379,6 @@ struct CollectiveMainloopBwdSm90 {
         // FlashMask
         int const h_flashmask;
         int const h_h_flashmask_ratio;
-        int const flashmask_maxmin_masklen;
 
         int32_t * __restrict__ const lt_start_ptr = nullptr;
         int32_t * __restrict__ const lt_end_ptr = nullptr;
@@ -454,7 +452,7 @@ struct CollectiveMainloopBwdSm90 {
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
-                args.h_flashmask, args.h_h_flashmask_ratio,args.flashmask_maxmin_masklen,
+                args.h_flashmask, args.h_h_flashmask_ratio,
                 args.lt_start_ptr, args.lt_end_ptr,
                 args.ut_start_ptr, args.ut_end_ptr,
                 args.flashmask_maxmin_ptr,

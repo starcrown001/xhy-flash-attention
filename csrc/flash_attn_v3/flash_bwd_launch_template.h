@@ -142,7 +142,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
                 params.dq_semaphore,
                 params.cu_seqlens_q, params.cu_seqlens_k,
                 params.seqused_q, params.seqused_k,
-                params.h_flashmask, params.h_h_flashmask_ratio,params.flashmask_maxmin_masklen,
+                params.h_flashmask, params.h_h_flashmask_ratio,
                 params.lt_start_ptr, params.lt_end_ptr,
                 params.ut_start_ptr, params.ut_end_ptr,
                 params.flashmask_maxmin_ptr,
