@@ -645,6 +645,142 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
+    CUTLASS_DEVICE
+    void
+    load_max_min(Params const& params,
+                 SeqlenInfo_t const& seqlen_info,
+                 cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
+                 int32_t* const flashmask_maxmin_smem_producer_) {
+        int const bidh = get<1>(block_coord);
+        int const bidb = get<2>(block_coord);
+        int row_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen_info.seqlen_k;
+        for(int64_t idx = threadIdx.x; idx < ((get<0>(params.shape_K) + kBlockN - 1) / kBlockN) / 4; idx += blockDim.x) {
+          // lt
+          if(params.lt_start_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + idx)),
+                  "l"(reinterpret_cast<int4*>(params.lt_start_nblockmax + row_offset) + idx),
+                  "n"(16));
+
+          if(params.lt_start_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + Flashmask_n_block_buffer_length / 4 + idx)),
+                  "l"(reinterpret_cast<int4*>(params.lt_start_nblockmin + row_offset) + idx),
+                  "n"(16));
+
+          if(params.lt_end_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + Flashmask_n_block_buffer_length / 4 * 2 + idx)),
+                  "l"(reinterpret_cast<int4*>(params.lt_end_nblockmax + row_offset) + idx),
+                  "n"(16));
+
+          if(params.lt_end_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + Flashmask_n_block_buffer_length / 4 * 3 + idx)),
+                  "l"(reinterpret_cast<int4*>(params.lt_end_nblockmin + row_offset) + idx),
+                  "n"(16));
+
+          // ut
+          if(params.ut_start_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + Flashmask_n_block_buffer_length / 4 * 4 + idx)),
+                  "l"(reinterpret_cast<int4*>(params.ut_start_nblockmax + row_offset) + idx),
+                  "n"(16));
+
+          if(params.ut_start_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + Flashmask_n_block_buffer_length / 4 * 5 + idx)),
+                  "l"(reinterpret_cast<int4*>(params.ut_start_nblockmin + row_offset) + idx),
+                  "n"(16));
+
+          if(params.ut_end_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + Flashmask_n_block_buffer_length / 4 * 6 + idx)),
+                  "l"(reinterpret_cast<int4*>(params.ut_end_nblockmax + row_offset) + idx),
+                  "n"(16));
+
+          if(params.ut_end_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + Flashmask_n_block_buffer_length / 4 * 7 + idx)),
+                  "l"(reinterpret_cast<int4*>(params.ut_end_nblockmin + row_offset) + idx),
+                  "n"(16));
+
+        }
+
+        for(int64_t idx = threadIdx.x + ((get<0>(params.shape_K) + kBlockN - 1) / kBlockN) / 4 * 4; idx < (get<0>(params.shape_K) + kBlockN - 1) / kBlockN; idx += blockDim.x) {
+          // lt
+          if(params.lt_start_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + idx)),
+                  "l"(params.lt_start_nblockmax + row_offset + idx),
+                  "n"(4));
+
+          if(params.lt_start_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + Flashmask_n_block_buffer_length + idx)),
+                  "l"(params.lt_start_nblockmin + row_offset + idx),
+                  "n"(4));
+
+          if(params.lt_end_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + Flashmask_n_block_buffer_length * 2 + idx)),
+                  "l"(params.lt_end_nblockmax + row_offset + idx),
+                  "n"(4));
+
+          if(params.lt_end_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + Flashmask_n_block_buffer_length * 3 + idx)),
+                  "l"(params.lt_end_nblockmin + row_offset + idx),
+                  "n"(4));
+          // ut
+          if(params.ut_start_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + Flashmask_n_block_buffer_length * 4 + idx)),
+                  "l"(params.ut_start_nblockmax + row_offset + idx),
+                  "n"(4));
+
+          if(params.ut_start_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + Flashmask_n_block_buffer_length * 5 + idx)),
+                  "l"(params.ut_start_nblockmin + row_offset + idx),
+                  "n"(4));
+
+          if(params.ut_end_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + Flashmask_n_block_buffer_length * 6 + idx)),
+                  "l"(params.ut_end_nblockmax + row_offset + idx),
+                  "n"(4));
+
+          if(params.ut_end_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + Flashmask_n_block_buffer_length * 7 + idx)),
+                  "l"(params.ut_end_nblockmin + row_offset + idx),
+                  "n"(4));
+        }
+
+        asm volatile("cp.async.commit_group;\n" ::);
+        asm volatile("cp.async.wait_group 0;\n" ::);
+
+//        __syncthreads();
+        cutlass::arch::NamedBarrier::sync(128, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
+    }
+
     CUTLASS_DEVICE void
     generate_n_block(Params const& params,
                      MainloopPipelineFlashMask pipeline_flashmask,

@@ -215,6 +215,7 @@ public:
 
         __shared__ bool mask_state_smem_[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kStages];
 
+#if 0
         for(int64_t idx = threadIdx.x; idx < ((get<0>(params.mainloop.shape_K) + kBlockN - 1) / kBlockN) / 4; idx += blockDim.x) {
           // lt
           if(params.mainloop.lt_start_nblockmax != nullptr)
@@ -339,6 +340,7 @@ public:
         asm volatile("cp.async.wait_group 0;\n" ::);
 
         __syncthreads();
+#endif
 
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
@@ -522,6 +524,7 @@ public:
                 auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
+                mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, flashmask_maxmin_smem_producer_);
                 mainloop.generate_n_block(params.mainloop, pipeline_flashmask, flashmask_pipe_write, seqlen_info, block_coord, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
                 // pipeline_vt won't be used if we don't need to transpose V.
                 if constexpr (SingleProducerWarp) {
