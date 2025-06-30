@@ -1165,7 +1165,7 @@ struct CollectiveMainloopFwdSm90 {
                   }
                   asm volatile("cp.async.commit_group;\n" ::);
                   asm volatile("cp.async.wait_group 0;\n" ::);
-                  cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
+//                  cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
                 }
                 pipeline_flashmask_apply.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
             }
@@ -1352,6 +1352,10 @@ struct CollectiveMainloopFwdSm90 {
   template <typename TiledMma, typename Engine, typename Layout>
   CUTLASS_DEVICE
   void flashmask_apply(Tensor<Engine, Layout> &tSrS, int const m_block, int const thread_idx, int const index, int32_t* const flashmask_smem_) {
+#if 0
+                       int32_t* const lt_start_ptr, int32_t* const lt_end_ptr,
+                       int32_t* const ut_start_ptr, int32_t* const ut_end_ptr
+#endif
       auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
 
       Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
@@ -1372,8 +1376,10 @@ struct CollectiveMainloopFwdSm90 {
         #pragma unroll
         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
           int const col_idx = get<Col>(tScS_rowcol(m, n)); // col_idx within a block
+//          if(row_idx >= s_lt_start[col_idx] && (lt_end_ptr == nullptr || row_idx < s_lt_end[col_idx]))
           if(row_idx >= s_lt_start[col_idx] && row_idx < s_lt_end[col_idx])
               tSrS_rowcol(m, n) = -INFINITY;
+//          if((ut_start_ptr == nullptr || row_idx >= s_ut_start[col_idx]) && (ut_end_ptr != nullptr && row_idx < s_ut_end[col_idx]))
           if(row_idx >= s_ut_start[col_idx] && row_idx < s_ut_end[col_idx])
               tSrS_rowcol(m, n) = -INFINITY;
         }
