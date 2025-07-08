@@ -7,7 +7,8 @@
 namespace flash {
 
   template <typename TiledMma,int kBlockM, int kBlockN,bool SwapAB, typename Engine, typename Layout>
-  CUTLASS_DEVICE
+  // CUTLASS_DEVICE
+  __device__
   void apply_flashmask_bwd(Tensor<Engine, Layout> &tSrS, int const thread_idx, int32_t const * flashmask_index_smem_, const int32_t m_block) {
 
       // static_assert(!PackGQA);

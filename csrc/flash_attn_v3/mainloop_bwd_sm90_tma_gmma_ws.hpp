@@ -894,7 +894,8 @@ struct CollectiveMainloopBwdSm90 {
     }
 
     template <typename SharedStorage, typename FrgTensordKV>
-    CUTLASS_DEVICE bool
+    __device__ bool
+    // CUTLASS_DEVICE bool
     mma(Params const& params,
         MainloopPipeline pipeline_q,
         MainloopPipeline_dO pipeline_do,
