@@ -1193,7 +1193,7 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
       if (!flashmask_lt_has_end || (flashmask_lt_has_end && flashmask_ltend_min >= binfo.actual_seqlen_q)) {
           m_block_max = min(m_block_max,
                             cute::ceil_div(flashmask_ltstart_max, kBlockM));
-      }
+      }    
     }
 
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
@@ -1454,7 +1454,7 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
     // Otherwise we get wrong result for the case where we don't enter the for loop.
     // And we might read OOB elements from gQ and gdO.
     // TODO: what if we're not parallelizing, do we need to compute dot_do_o?
-    if (Is_causal && m_block < m_block_min) {
+    if (m_block < m_block_min || m_block_max == 0) {
         const index_t row_offset_dk = binfo.k_offset(params.dk_batch_stride, params.dk_row_stride, bidb)
           + n_block * kBlockN * params.dk_row_stride + bidh * params.dk_head_stride;
         const index_t row_offset_dv = binfo.k_offset(params.dv_batch_stride, params.dv_row_stride, bidb)
@@ -1507,7 +1507,7 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
     Tensor tdOrdO = make_fragment_like(tdOgdO);
     Tensor tdOrO = make_fragment_like(tdOgO);
     if (!Is_first) {
-        // Clear the smem tiles to account for predicated off loads
+        // Clear the smem tiles to account for predicated off loads      
         flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
             gmem_tiled_copy_dO, tdOgdO, tdOsdO, tQcQ, tQpQ, binfo.actual_seqlen_q - m_block * kBlockM
         );
@@ -1965,7 +1965,7 @@ inline __device__ void compute_dq_dk_dv_1colblock_flashmask(const Params &params
 
     cute::copy(smem_tiled_copy_dKV, taccdKrdK, taccdKsdK);
     cute::copy(smem_tiled_copy_dKV, taccdVrdV, taccdVsdV);
-
+    
     const index_t row_offset_dk = binfo.k_offset(params.dk_batch_stride, params.dk_row_stride, bidb)
        + n_block * kBlockN * params.dk_row_stride + bidh * params.dk_head_stride;
     const index_t row_offset_dv = binfo.k_offset(params.dv_batch_stride, params.dv_row_stride, bidb)
