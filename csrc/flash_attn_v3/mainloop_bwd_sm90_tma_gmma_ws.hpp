@@ -504,7 +504,7 @@ struct CollectiveMainloopBwdSm90 {
     CUTLASS_DEVICE
     void load_n_block_info( int32_t *  fm_mem, int32_t * flashmask_index_smem_,cute::tuple<int32_t, int32_t, int32_t> block_coord, Params const& params){
         auto [n_block, bidh, bidb] = block_coord;
-        int const seqlen = get<0>(params.shape_Q);
+        int const seqlen = get<0>(params.shape_K);
         if(cute::elect_one_sync()){
             fm_mem[0] = params.lt_start_nblockmax == nullptr ? INT_MAX : params.lt_start_nblockmax[n_block];
             fm_mem[1] = params.lt_start_nblockmin == nullptr ? INT_MIN : params.lt_start_nblockmin[n_block];
@@ -518,7 +518,7 @@ struct CollectiveMainloopBwdSm90 {
             // if(bidb ==0 and bidh == 2) printf("params.ut_end_nblockmax: %d, params.ut_end_nblockmin: %d ,n_block: %d\n", fm_mem[6], fm_mem[7], n_block);
             // printf("bidh: %d, bidb: %d, n_block: %d\n", bidh, bidb, n_block);
             // printf("params.h_flashmask: %d, params.h_h_flashmask_ratio: %d,get<0>(params.shape_Q): %d", params.h_flashmask, params.h_h_flashmask_ratio, get<0>(params.shape_Q));
-            int row_offset1 = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen + n_block * kBlockN;
+            // int row_offset1 = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen + n_block * kBlockN;
             // printf("row_offset: %d",row_offset1);
         }
         int const thread_idx = threadIdx.x;
@@ -630,7 +630,7 @@ struct CollectiveMainloopBwdSm90 {
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
         int m_block = m_block_min;
-        int const thread_idx = threadIdx.x % NumProducerThreads;
+        // int const thread_idx = threadIdx.x % NumProducerThreads;
 
         int lane_predicate = cute::elect_one_sync();
         // if(lane_predicate){
