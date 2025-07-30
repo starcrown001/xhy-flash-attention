@@ -9,7 +9,6 @@ execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
 
 option(SKIP_BUILD_FA "Enable compile with FA3" OFF)
 option(WITH_FLASHATTN_V3 "Enable compile with FA3" OFF)
-option(WITH_FLASHMASK_V2 "Enable build flashmask_v2" OFF)
 
 if(NOT GIT_SUBMOD_RESULT EQUAL 0)
     message(FATAL_ERROR "Failed to update Git submodules")
@@ -398,7 +397,7 @@ if(NOT SKIP_BUILD_FA)
     INSTALL(FILES flash_attn_v3/flash_api.h DESTINATION "include" RENAME flashv3_api.h)
   endif()
 
-  if(WITH_FLASHMASK_V2) 
+  if(WITH_FLASHATTN_V3) 
     execute_process(
         COMMAND "${PYTHON_EXECUTABLE}" flashmask_v2/generate_kernels.py -o flashmask_v2/instantiations
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
