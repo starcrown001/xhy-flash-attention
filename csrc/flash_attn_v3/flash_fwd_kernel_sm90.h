@@ -54,7 +54,6 @@ public:
 
     // Mainloop derived types
     using TileShape_MNK_PV = typename CollectiveMainloop::TileShape_MNK_PV;
-    using TileShape_MNK = typename CollectiveMainloop::TileShape_MNK;
     using TiledMmaPV = typename CollectiveMainloop::TiledMmaPV;
     using ArchTag = typename CollectiveMainloop::ArchTag;
     using ClusterShape = typename CollectiveMainloop::ClusterShape;
@@ -77,18 +76,11 @@ public:
     static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMmaPV{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup);
     static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
     static_assert(NumMmaWarpGroups == 1 || NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
-    static_assert(NumMmaWarpGroups == 2 && Use_TMA_KV);
 
     /// Register requirement for Load and Math WGs
     // If we use cp.async to load K and V, we need more registers for the producer WG.
-//    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
-//    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 56 : 40) : 32);
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 224 : 232) : 160);
-
-    // static constexpr uint32_t LoadRegisterRequirement = (NumMmaWarpGroups == 1 ? 72 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32));
-    // static constexpr uint32_t MmaRegisterRequirement = (NumMmaWarpGroups == 1 ? 272 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160));
-
+    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
+    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
     // static constexpr uint32_t LoadRegisterRequirement = 40;
@@ -119,8 +111,6 @@ public:
             alignas(16) typename CollectiveMainloop::MainloopPipelineVt::SharedStorage pipeline_vt;
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_k_new;
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
-            alignas(16) typename CollectiveMainloop::MainloopPipelineFlashMask::SharedStorage pipeline_flashmask;
-            alignas(16) typename CollectiveMainloop::MainloopPipelineFlashMaskApply::SharedStorage pipeline_flashmask_apply;
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
 
@@ -191,154 +181,18 @@ public:
         static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int MmaThreadOffset = NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
-        static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
         using MainloopPipelineK = typename CollectiveMainloop::MainloopPipelineK;
         using MainloopPipelineV = typename CollectiveMainloop::MainloopPipelineV;
         using MainloopPipelineVt = typename CollectiveMainloop::MainloopPipelineVt;
         using MainloopPipelineKVNew = typename CollectiveMainloop::MainloopPipelineKVNew;
-        using MainloopPipelineFlashMask = typename CollectiveMainloop::MainloopPipelineFlashMask;
-        using MainloopPipelineFlashMaskApply = typename CollectiveMainloop::MainloopPipelineFlashMaskApply;
         using PipelineState = typename CollectiveMainloop::PipelineState;
         using PipelineParamsK = typename MainloopPipelineK::Params;
         using PipelineParamsV = typename MainloopPipelineV::Params;
         using PipelineParamsVt = typename MainloopPipelineVt::Params;
         using PipelineParamsKVNew = typename MainloopPipelineKVNew::Params;
-        using PipelineParamsFlashMask = typename MainloopPipelineFlashMask::Params;
-        using PipelineParamsFlashMaskApply = typename MainloopPipelineFlashMaskApply::Params;
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
-
-        __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
-        __shared__ __align__(16) int32_t flashmask_maxmin_smem_producer_[8 * CollectiveMainloop::Flashmask_n_block_buffer_length];
-        __shared__ int32_t n_block_smem_[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kFlashMaskStages];
-
-        __shared__ bool mask_state_smem_[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kStages];
-
-        for(int64_t idx = threadIdx.x; idx < ((get<0>(params.mainloop.shape_K) + kBlockN - 1) / kBlockN) / 4; idx += blockDim.x) {
-          // lt
-          if(params.mainloop.lt_start_nblockmax != nullptr)
-            asm volatile(
-              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + idx)),
-                  "l"(reinterpret_cast<int4*>(params.mainloop.lt_start_nblockmax) + idx),
-                  "n"(16));
-
-          if(params.mainloop.lt_start_nblockmin != nullptr)
-            asm volatile(
-              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 + idx)),
-                  "l"(reinterpret_cast<int4*>(params.mainloop.lt_start_nblockmin) + idx),
-                  "n"(16));
-
-          if(params.mainloop.lt_end_nblockmax != nullptr)
-            asm volatile(
-              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 2 + idx)),
-                  "l"(reinterpret_cast<int4*>(params.mainloop.lt_end_nblockmax) + idx),
-                  "n"(16));
-
-          if(params.mainloop.lt_end_nblockmin != nullptr)
-            asm volatile(
-              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 3 + idx)),
-                  "l"(reinterpret_cast<int4*>(params.mainloop.lt_end_nblockmin) + idx),
-                  "n"(16));
-
-          // ut
-          if(params.mainloop.ut_start_nblockmax != nullptr)
-            asm volatile(
-              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 4 + idx)),
-                  "l"(reinterpret_cast<int4*>(params.mainloop.ut_start_nblockmax) + idx),
-                  "n"(16));
-
-          if(params.mainloop.ut_start_nblockmin != nullptr)
-            asm volatile(
-              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 5 + idx)),
-                  "l"(reinterpret_cast<int4*>(params.mainloop.ut_start_nblockmin) + idx),
-                  "n"(16));
-
-          if(params.mainloop.ut_end_nblockmax != nullptr)
-            asm volatile(
-              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 6 + idx)),
-                  "l"(reinterpret_cast<int4*>(params.mainloop.ut_end_nblockmax) + idx),
-                  "n"(16));
-
-          if(params.mainloop.ut_end_nblockmin != nullptr)
-            asm volatile(
-              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 7 + idx)),
-                  "l"(reinterpret_cast<int4*>(params.mainloop.ut_end_nblockmin) + idx),
-                  "n"(16));
-
-        }
-
-        for(int64_t idx = threadIdx.x + ((get<0>(params.mainloop.shape_K) + kBlockN - 1) / kBlockN) / 4 * 4; idx < (get<0>(params.mainloop.shape_K) + kBlockN - 1) / kBlockN; idx += blockDim.x) {
-          // lt
-          if(params.mainloop.lt_start_nblockmax != nullptr)
-            asm volatile(
-              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + idx)),
-                  "l"(params.mainloop.lt_start_nblockmax + idx),
-                  "n"(4));
-
-          if(params.mainloop.lt_start_nblockmin != nullptr)
-            asm volatile(
-              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length + idx)),
-                  "l"(params.mainloop.lt_start_nblockmin + idx),
-                  "n"(4));
-
-          if(params.mainloop.lt_end_nblockmax != nullptr)
-            asm volatile(
-              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 2 + idx)),
-                  "l"(params.mainloop.lt_end_nblockmax + idx),
-                  "n"(4));
-
-          if(params.mainloop.lt_end_nblockmin != nullptr)
-            asm volatile(
-              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 3 + idx)),
-                  "l"(params.mainloop.lt_end_nblockmin + idx),
-                  "n"(4));
-          // ut
-          if(params.mainloop.ut_start_nblockmax != nullptr)
-            asm volatile(
-              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 4 + idx)),
-                  "l"(params.mainloop.ut_start_nblockmax + idx),
-                  "n"(4));
-
-          if(params.mainloop.ut_start_nblockmin != nullptr)
-            asm volatile(
-              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 5 + idx)),
-                  "l"(params.mainloop.ut_start_nblockmin + idx),
-                  "n"(4));
-
-          if(params.mainloop.ut_end_nblockmax != nullptr)
-            asm volatile(
-              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 6 + idx)),
-                  "l"(params.mainloop.ut_end_nblockmax + idx),
-                  "n"(4));
-
-          if(params.mainloop.ut_end_nblockmin != nullptr)
-            asm volatile(
-              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 7 + idx)),
-                  "l"(params.mainloop.ut_end_nblockmin + idx),
-                  "n"(4));
-        }
-
-        asm volatile("cp.async.commit_group;\n" ::);
-        asm volatile("cp.async.wait_group 0;\n" ::);
-
-        __syncthreads();
 
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
@@ -438,25 +292,6 @@ public:
         }
         auto pipeline_v_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_v_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
 
-        PipelineParamsFlashMask pipeline_params_flashmask;
-        pipeline_params_flashmask.role = warp_group_idx == 0
-            ? MainloopPipelineFlashMask::ThreadCategory::Producer
-            : MainloopPipelineFlashMask::ThreadCategory::Consumer;
-        pipeline_params_flashmask.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup; // TODO(umiswing): how to deal with LargeHeadDimV?
-//        pipeline_params_flashmask.producer_arv_count = NumProducerThreads;
-        pipeline_params_flashmask.producer_arv_count = 128;
-
-        MainloopPipelineFlashMask pipeline_flashmask(shared_storage.pipelines.pipeline_flashmask, pipeline_params_flashmask);
-
-        PipelineParamsFlashMaskApply pipeline_params_flashmask_apply;
-        pipeline_params_flashmask_apply.role = warp_group_idx == 0
-            ? MainloopPipelineFlashMask::ThreadCategory::Producer
-            : MainloopPipelineFlashMask::ThreadCategory::Consumer;
-        pipeline_params_flashmask_apply.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup; // TODO(umiswing): how to deal with LargeHeadDimV?
-        pipeline_params_flashmask_apply.producer_arv_count = NumProducerThreads;
-
-        MainloopPipelineFlashMaskApply pipeline_flashmask_apply(shared_storage.pipelines.pipeline_flashmask_apply, pipeline_params_flashmask_apply);
-
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
 
@@ -473,24 +308,18 @@ public:
         if (warp_group_idx == 0) {  // Producer
             cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
 
-
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
             // might use cp.async to load KV (if PagedKVNonTMA) while AppendKV always uses TMA to load
             // KV_new. Since the pipeline states are different, we have to manually sync to make
             // sure the two pipelines don't race when accessing smem_k and smem_v.
             PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
             PipelineState smem_pipe_write_new = cutlass::make_producer_start_state<MainloopPipelineKVNew>();
-            cutlass::PipelineState<CollectiveMainloop::kFlashMaskStages> flashmask_pipe_write = cutlass::make_producer_start_state<MainloopPipelineFlashMask>();
-
             int work_idx = 0;
             int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
             static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
-            static_assert(SingleProducerWarp);
-#if 0
             if constexpr (SingleProducerWarp) {
                 if (warp_idx_in_warpgroup != 0) { return; }
             }
-#endif
             if (!SingleProducerWarp && warp_idx_in_warpgroup != 0) { scheduler.init_consumer(); }
 
             cutlass::arch::wait_on_dependent_grids();
@@ -522,24 +351,11 @@ public:
                 auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
-                mainloop.generate_n_block(params.mainloop, pipeline_flashmask, flashmask_pipe_write, seqlen_info, block_coord, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
                 // pipeline_vt won't be used if we don't need to transpose V.
-                if constexpr (SingleProducerWarp) {
-                  if (warp_idx_in_warpgroup == 0) {
-                mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, pipeline_flashmask_apply, smem_pipe_write,
-                                         flashmask_pipe_write,
-                                         shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx,
-                                         flashmask_smem_, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
-                  }
-                }
-                ++flashmask_pipe_write;
+                mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
+                                         shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
             }
-
-            if constexpr (SingleProducerWarp) {
-              if (warp_idx_in_warpgroup == 0) {
-            mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write, flashmask_pipe_write, shared_storage, work_idx);
-              }
-            }
+            mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
@@ -548,7 +364,6 @@ public:
 
             PipelineState smem_pipe_read;
             PipelineState smem_pipe_read_new;
-            cutlass::PipelineState<CollectiveMainloop::kFlashMaskStages> flashmask_pipe_read;
             // We don't need separate variables smem_pipe_release_k and smem_pipe_release_v
             // (like in Cutlass's gemm) because the read and release pipeline states are always the same.
 
@@ -602,21 +417,17 @@ public:
                 bool tile_valid;
                 if constexpr (!LargeHeadDimV) {
                     tile_valid = mainloop.mma(
-                        params.mainloop, pipeline_k, pipeline_v, pipeline_flashmask, pipeline_flashmask_apply, smem_pipe_read,
-                        flashmask_pipe_read,
-                        tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                        flashmask_smem_, n_block_smem_, mask_state_smem_);
+                        params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
+                        tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
-                            params.mainloop, pipeline_k, pipeline_v, pipeline_flashmask, smem_pipe_read,
-                            tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                            flashmask_smem_, n_block_smem_, mask_state_smem_);
+                            params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
+                            tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
                     } else {
                         tile_valid = mainloop.mma_pv(
-                            params.mainloop, pipeline_v, pipeline_flashmask, smem_pipe_read,
-                            tOrO, softmax, threadIdx.x - MmaThreadOffset, seqlen_info, block_coord, shared_storage,
-                            flashmask_smem_);
+                            params.mainloop, pipeline_v, smem_pipe_read,
+                            tOrO, softmax, threadIdx.x - MmaThreadOffset, seqlen_info, block_coord, shared_storage);
                     }
                 }
                 // Do this here before the epilogue so that the next tile is ready to go.
