@@ -78,7 +78,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
     int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
     dim3 grid_m(num_m_block, params.h, params.b);
-    cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/);
+    flash::flashmask_kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/);
     CHECK_CUDA(cudaGetLastError());
     // flash::print_addr_value<<<1, 1,0,stream>>>(params.lt_start_ptr, 0);
     // printf("point2\n");
@@ -249,7 +249,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     // int smem_size_dpsum = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_dpsum));
     // printf("smem_size = %d, q = %d, k = %d, v = %d, do = %d, ds = %d, dqacc = %d, lse = %d, dpsum = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v, smem_size_do, smem_size_ds, smem_size_dqacc, smem_size_lse, smem_size_dpsum);
     if constexpr (size(ClusterShape{}) > 1) {
-        void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
+        void const* kernel = (void const*) flash::cutlass_flashmask_kernel<AttnKernel>;
         if (smem_size >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
@@ -257,7 +257,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         cutlass::ClusterLauncher::launch(
             grid_dims, cluster_dims, block_dims, smem_size, stream, kernel, kernel_params, false /*launch_with_pdl*/);
     } else {
-        void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
+        void const* kernel = (void const*) flash::cutlass_flashmask_kernel<AttnKernel>;
         if (smem_size >= 48 * 1024) {
             int max_smem;
             CHECK_CUDA(cudaGetLastError());
@@ -266,7 +266,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
             // printf("pass");
         }
-        cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, false /*launch_with_pdl*/);
+        flash::flashmask_kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, false /*launch_with_pdl*/);
     }
     CHECK_CUDA_KERNEL_LAUNCH();
 
@@ -291,9 +291,9 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     dim3 grid_m_postprocess(num_m_block_postprocess, params.h, params.b);
     int smem_size_postprocess = PostprocessKernel::SharedStorageSize;
     if (smem_size_postprocess >= 48 * 1024) {
-        CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
+        CHECK_CUDA(cudaFuncSetAttribute(flash::cutlass_flashmask_kernel<PostprocessKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
     }
-    cutlass::kernel_launch<PostprocessKernel>(grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_params, false /*launch_with_pdl*/);
+    flash::flashmask_kernel_launch<PostprocessKernel>(grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_params, false /*launch_with_pdl*/);
     CHECK_CUDA_KERNEL_LAUNCH();
 
     if constexpr (GQA) {
@@ -331,11 +331,11 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         dim3 grid_n_postprocess(num_n_block_postprocess, params.h_k, params.b);
         int smem_size_postprocess = PostprocessKerneldKV::SharedStorageSize;
         if (smem_size_postprocess >= 48 * 1024) {
-            CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKerneldKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
+            CHECK_CUDA(cudaFuncSetAttribute(flash::cutlass_flashmask_kernel<PostprocessKerneldKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
         }
-        cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/);
+        flash::flashmask_kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
-        cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dV_params, false /*launch_with_pdl*/);
+        flash::flashmask_kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dV_params, false /*launch_with_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
 

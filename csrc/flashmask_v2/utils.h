@@ -667,7 +667,7 @@ CUTLASS_GLOBAL
 // Enclosing this in __CUDACC__ suppresses MSVC warnings.
 __launch_bounds__(Operator::MaxThreadsPerBlock, Operator::MinBlocksPerMultiprocessor)
 #endif // __CUDACC__
-void flashmask_kernel(CUTLASS_GRID_CONSTANT typename Operator::Params const params)
+void cutlass_flashmask_kernel(CUTLASS_GRID_CONSTANT typename Operator::Params const params)
 {
   // Dynamic shared memory base pointer
   extern __shared__ __align__(1024) char smem[]; //xhy: fa3 tma needs to be aligned 
@@ -676,6 +676,71 @@ void flashmask_kernel(CUTLASS_GRID_CONSTANT typename Operator::Params const para
   op(params, smem);
   cutlass::arch::synclog_print();
 
+}
+
+template <typename GemmKernel, typename Params>
+cutlass::Status flashmask_kernel_launch(
+    dim3 const grid_dims,
+    dim3 const block_dims,
+    size_t const smem_size,
+    cudaStream_t cuda_stream,
+    const Params &kernel_params,
+    bool launch_with_pdl) {
+#if (CUTLASS_DEBUG_TRACE_LEVEL > 1)
+  CUTLASS_TRACE_HOST("cutlass::kernel_launch");
+#endif
+
+  if (not launch_with_pdl) {
+#if (CUTLASS_DEBUG_TRACE_LEVEL > 1)
+    CUTLASS_TRACE_HOST("cutlass::kernel_launch: No PDL");
+#endif
+    cutlass_flashmask_kernel<GemmKernel><<<grid_dims, block_dims, smem_size, cuda_stream>>>(kernel_params);
+  }
+  else {
+#if ((__CUDACC_VER_MAJOR__ >= 12) || ((__CUDACC_VER_MAJOR__ == 11) && (__CUDACC_VER_MINOR__ >= 8)))
+    if constexpr (GemmKernel::ArchTag::kMinComputeCapability < 90) {
+      CUTLASS_TRACE_HOST("  Programmatic dependent launch (PDL) is only supported for SM90.");
+      return cutlass::Status::kInvalid;
+    }
+
+    cudaLaunchConfig_t config;
+    cudaLaunchAttribute attrs[1];
+
+    config.gridDim = grid_dims;
+    config.blockDim = block_dims;
+    config.dynamicSmemBytes = smem_size;
+    config.stream = cuda_stream;
+
+    config.attrs = attrs;
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    config.numAttrs = 1;
+
+#if (CUTLASS_DEBUG_TRACE_LEVEL > 1)
+    CUTLASS_TRACE_HOST("cutlass::kernel_launch: Calling cudaLaunchKernelEx");
+#endif
+    cudaError_t launch_result = cudaLaunchKernelEx(&config, &cutlass_flashmask_kernel<GemmKernel>, kernel_params);
+    if (cudaSuccess != launch_result) {
+      CUTLASS_TRACE_HOST("cutlass::kernel_launch: cudaLaunchKernelEx failed with error: " << cudaGetErrorString(launch_result));
+      return cutlass::Status::kErrorInternal;
+    }
+#else
+    CUTLASS_TRACE_HOST("  Programmatic dependent launch (PDL) is only supported starting CUDA 11.8.");
+    return cutlass::Status::kInvalid;
+#endif
+  }
+
+  cudaError_t result = cudaGetLastError();
+  if (cudaSuccess == result) {
+#if (CUTLASS_DEBUG_TRACE_LEVEL > 1)
+    CUTLASS_TRACE_HOST("cutlass::kernel_launch: cudaGetLastError reports success");
+#endif
+    return cutlass::Status::kSuccess;
+  }
+  else {
+    CUTLASS_TRACE_HOST("  Kernel launch failed. Reason: " << result);
+    return cutlass::Status::kErrorInternal;
+  }
 }
 
 } // namespace flash
