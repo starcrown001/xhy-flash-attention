@@ -505,32 +505,37 @@ struct CollectiveMainloopBwdSm90 {
     void load_n_block_info( int32_t *  fm_mem, int32_t * flashmask_index_smem_,cute::tuple<int32_t, int32_t, int32_t> block_coord, Params const& params){
         auto [n_block, bidh, bidb] = block_coord;
         int const seqlen = get<0>(params.shape_K);
-        if(cute::elect_one_sync()){
-            fm_mem[0] = params.lt_start_nblockmax == nullptr ? INT_MAX : params.lt_start_nblockmax[n_block];
-            fm_mem[1] = params.lt_start_nblockmin == nullptr ? INT_MIN : params.lt_start_nblockmin[n_block];
-            // if(bidb ==0 and bidh == 2) printf("params.lt_start_nblockmax: %d, params.lt_start_nblockmin: %d ,n_block: %d\n", fm_mem[0], fm_mem[1], n_block);
-            fm_mem[2] = params.lt_end_nblockmax == nullptr ? INT_MAX : params.lt_end_nblockmax[n_block];
-            fm_mem[3] = params.lt_end_nblockmin == nullptr ? INT_MIN : params.lt_end_nblockmin[n_block];
-            fm_mem[4] = params.ut_start_nblockmax == nullptr ? INT_MAX : params.ut_start_nblockmax[n_block];
-            fm_mem[5] = params.ut_start_nblockmin == nullptr ? INT_MIN : params.ut_start_nblockmin[n_block];
-            fm_mem[6] = params.ut_end_nblockmax == nullptr ? INT_MAX : params.ut_end_nblockmax[n_block];
-            fm_mem[7] = params.ut_end_nblockmin == nullptr ? INT_MIN : params.ut_end_nblockmin[n_block];
-            // if(bidb ==0 and bidh == 2) printf("params.ut_end_nblockmax: %d, params.ut_end_nblockmin: %d ,n_block: %d\n", fm_mem[6], fm_mem[7], n_block);
+        int const thread_idx = threadIdx.x;
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});
+        int bh_offset = bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio;
+        int n_block_seqlen = ((seqlen + kBlockN - 1) / kBlockN + 3) / 4 * 4;
+        int bh_offset_block = bh_offset * n_block_seqlen;
+        if(thread_idx == 0){
+            fm_mem[0] = params.lt_start_nblockmax == nullptr ? INT_MAX : params.lt_start_nblockmax[bh_offset_block + n_block];
+            fm_mem[1] = params.lt_start_nblockmin == nullptr ? INT_MIN : params.lt_start_nblockmin[bh_offset_block + n_block];
+            // if(bidb ==1 and bidh == 0) printf("params.lt_start_nblockmax: %d, params.lt_start_nblockmin: %d ,n_block: %d\n", fm_mem[0], fm_mem[1], n_block);
+            fm_mem[2] = params.lt_end_nblockmax == nullptr ? INT_MAX : params.lt_end_nblockmax[bh_offset_block + n_block];
+            fm_mem[3] = params.lt_end_nblockmin == nullptr ? INT_MIN : params.lt_end_nblockmin[bh_offset_block + n_block];
+            fm_mem[4] = params.ut_start_nblockmax == nullptr ? INT_MAX : params.ut_start_nblockmax[bh_offset_block + n_block];
+            fm_mem[5] = params.ut_start_nblockmin == nullptr ? INT_MIN : params.ut_start_nblockmin[bh_offset_block + n_block];
+            fm_mem[6] = params.ut_end_nblockmax == nullptr ? INT_MAX : params.ut_end_nblockmax[bh_offset_block + n_block];
+            fm_mem[7] = params.ut_end_nblockmin == nullptr ? INT_MIN : params.ut_end_nblockmin[bh_offset_block + n_block];
+            // if(bidb ==1 and bidh == 0) printf("params.ut_end_nblockmax: %d, params.ut_end_nblockmin: %d ,n_block: %d\n", fm_mem[6], fm_mem[7], n_block);
             // printf("bidh: %d, bidb: %d, n_block: %d\n", bidh, bidb, n_block);
             // printf("params.h_flashmask: %d, params.h_h_flashmask_ratio: %d,get<0>(params.shape_Q): %d", params.h_flashmask, params.h_h_flashmask_ratio, get<0>(params.shape_Q));
             // int row_offset1 = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen + n_block * kBlockN;
             // printf("row_offset: %d",row_offset1);
         }
-        int const thread_idx = threadIdx.x;
-        static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        int row_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen + n_block * kBlockN;
+        int row_offset = bh_offset * seqlen + n_block * kBlockN;
+        // if(thread_idx == 0 and n_block == 0) printf("row_offset: %d, bidb: %d,h_flashmask: %d, h_h_flashmask_ratio: %d\n",row_offset,bidb,params.h_flashmask,params.h_h_flashmask_ratio);
         bool is_oob = n_block * kBlockN + thread_idx >= seqlen;
         //xhy:kBlockN in fa3 is always less than 128
         if(thread_idx < kBlockN) flashmask_index_smem_[thread_idx] = is_oob ? INT_MIN : (params.lt_start_ptr == nullptr ? (params.lt_end_ptr == nullptr ? INT_MAX :INT_MIN) :params.lt_start_ptr[thread_idx + row_offset]);
-            // if(bidb ==0 and bidh == 2) printf("threadidx: %d,bidb: %d,bidh: %d,n_block: %d, row_offset: %d, lt_start_flashmask_index_smem_%d: %d\n", thread_idx,bidb,bidh,n_block,row_offset,i,flashmask_index_smem_[i]);
+        // if(thread_idx < kBlockN) if(bidb ==1 and bidh == 0) printf("threadidx: %d,bidb: %d,bidh: %d,n_block: %d, row_offset: %d, lt_start_flashmask_index_smem_%d: %d\n", thread_idx,bidb,bidh,n_block,thread_idx + row_offset-seqlen,thread_idx,flashmask_index_smem_[thread_idx]);
         if(thread_idx < kBlockN) flashmask_index_smem_[thread_idx + kBlockN] = is_oob ? INT_MAX : (params.lt_end_ptr == nullptr ? (params.lt_start_ptr == nullptr? INT_MIN :INT_MAX): params.lt_end_ptr[thread_idx + row_offset]);
         if(thread_idx < kBlockN) flashmask_index_smem_[thread_idx + 2 * kBlockN] = is_oob ? INT_MIN : (params.ut_start_ptr == nullptr ? (params.ut_end_ptr == nullptr ? INT_MAX :INT_MIN) : params.ut_start_ptr[thread_idx + row_offset]);
         if(thread_idx < kBlockN) flashmask_index_smem_[thread_idx + 3 * kBlockN] = is_oob ? INT_MAX : (params.ut_end_ptr == nullptr ? (params.ut_start_ptr == nullptr? INT_MIN :INT_MAX) : params.ut_end_ptr[thread_idx + row_offset]);
+        // if(thread_idx < kBlockN) if(bidb ==1 and bidh == 0) printf("threadidx: %d,bidb: %d,bidh: %d,n_block: %d, row_offset: %d, ut_end_flashmask_index_smem_%d: %d\n", thread_idx,bidb,bidh,n_block,thread_idx + row_offset-seqlen,thread_idx,flashmask_index_smem_[thread_idx + 3 * kBlockN]);
             // if(bidb ==0 and (bidh == 0 or bidh == 2) and n_block * kBlockN + i < seqlen and params.ut_end_ptr != nullptr) printf("threadidx: %d,bidb: %d,bidh: %d,n_block: %d, row_offset: %d, ut_end_flashmask_index_smem_%d: %d, params.ut_end_ptr_val: %d, params.ut_end_ptr_ptr: %p\n", thread_idx,bidb,bidh,n_block,row_offset,i,flashmask_index_smem_[i + 3 * kBlockN],params.ut_end_ptr[i + row_offset],params.ut_end_ptr + i + row_offset);
         cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::Flashmask) /*id*/);
         // printf("pass\n");
