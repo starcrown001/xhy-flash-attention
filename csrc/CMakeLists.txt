@@ -613,6 +613,7 @@ if(NOT SKIP_BUILD_FA)
 else()
   INSTALL(FILES capi/flash_attn.h DESTINATION "include")
   INSTALL(FILES flash_attn_v3/flash_api.h DESTINATION "include" RENAME flashv3_api.h)
+  INSTALL(FILES flashmask_v2/flash_api.h DESTINATION "include" RENAME flashmaskv2_api.h)
 
 endif()
 #SKIP_BUILD_FA
