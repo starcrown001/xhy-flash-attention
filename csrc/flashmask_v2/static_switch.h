@@ -27,6 +27,29 @@
     }                                                                                            \
   }()
 
+#define FLASH_MASK_SWITCH(LTE_COND, UTS_COND, LTS_CONST_NAME, UTS_CONST_NAME, ...) \
+  [&] {                                                                                                      \
+    if (LTE_COND) {                                                                                          \
+      constexpr static bool LTS_CONST_NAME = true;                                                           \
+        if (UTS_COND) {                                                                                      \
+          constexpr static bool UTS_CONST_NAME = true;                                                       \
+          return __VA_ARGS__();                                                                              \
+        } else {                                                                                             \
+          constexpr static bool UTS_CONST_NAME = false;                                                      \
+          return __VA_ARGS__();                                                                              \
+        }                                                                                                    \
+    } else {                                                                                                 \
+      constexpr static bool LTS_CONST_NAME = false;                                                          \
+        if (UTS_COND) {                                                                                      \
+          constexpr static bool UTS_CONST_NAME = true;                                                       \
+          return __VA_ARGS__();                                                                              \
+        } else {                                                                                             \
+          constexpr static bool UTS_CONST_NAME = false;                                                      \
+          return __VA_ARGS__();                                                                              \
+        }                                                                                                    \
+    }                                                                                                        \
+  }()
+
 #ifdef FLASHMASK_V2_DISABLE_LOCAL
   #define CAUSAL_LOCAL_SWITCH(CAUSAL_COND, LOCAL_COND, CAUSAL_CONST_NAME, LOCAL_CONST_NAME, ...) \
     [&] {                                                                                        \
