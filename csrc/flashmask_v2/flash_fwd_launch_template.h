@@ -131,6 +131,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.lt_end_nblockmax, params.lt_end_nblockmin,
         params.ut_start_nblockmax, params.ut_start_nblockmin,
         params.ut_end_nblockmax, params.ut_end_nblockmin,
+        params.m_block_dim,params.n_block_dim,
+        params.block_mask_ptr
     };
 
     typename CollectiveEpilogue::Arguments epilogue_args {

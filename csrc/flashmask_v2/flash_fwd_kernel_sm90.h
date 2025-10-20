@@ -209,11 +209,16 @@ public:
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
-        __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
-        __shared__ __align__(16) int32_t flashmask_maxmin_smem[8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
-        __shared__ int32_t n_block_smem[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
-
-        __shared__ bool partially_masked_smem[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        //xhy: tmp only support seqlen <= 128K and mask blockdim = 128;
+        if(threadIdx.x == 0 && blockIdx.x == 0){
+            printf("CollectiveMainloop::Blockmask_n_block_buffer_valid_length: %d",CollectiveMainloop::Blockmask_n_block_buffer_valid_length);
+        }
+        __shared__ __align__(128) int32_t block_mask_smem_[CollectiveMainloop::Blockmask_n_block_buffer_valid_length * CollectiveMainloop::kNBlockStages];
+        __shared__ __align__(128)int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
+        __shared__ __align__(128) int32_t flashmask_maxmin_smem[8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        __shared__ __align__(128)int32_t n_block_smem[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        __shared__ __align__(128)bool partially_masked_smem[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        if(threadIdx.x == 0 && blockIdx.x == 0) printf("block_mask_smem_:%p, flashmask_smem_:%p, flashmask_maxmin_smem:%p, n_block_smem:%p, partially_masked_smem:%p",block_mask_smem_,flashmask_smem_,flashmask_maxmin_smem,n_block_smem,partially_masked_smem);
 
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
@@ -295,7 +300,9 @@ public:
                 if (valid_chunk) {
                   pipeline_n_block.producer_acquire(n_block_pipe_write);
                 }
-                mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
+                mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, 
+                                        flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
+                                         block_mask_smem_ + CollectiveMainloop::Blockmask_n_block_buffer_valid_length * n_block_pipe_write.index());
                 valid_chunk = mainloop.generate_n_block(params.mainloop,
                                           seqlen_info,
                                           block_coord,
@@ -303,7 +310,8 @@ public:
                                           reverse_chunk_idx == num_chunk - 1 ? CollectiveMainloop::Flashmask_n_block_finish : CollectiveMainloop::Flashmask_n_block_chunk_end,
                                           flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
                                           n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
-                                          partially_masked_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
+                                          partially_masked_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
+                                          block_mask_smem_ + CollectiveMainloop::Blockmask_n_block_buffer_valid_length * n_block_pipe_write.index());
                 if (valid_chunk) {
                   pipeline_n_block.producer_commit(n_block_pipe_write);
                   ++n_block_pipe_write;

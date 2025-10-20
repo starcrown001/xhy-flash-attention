@@ -77,6 +77,8 @@ struct CollectiveMainloopFwdSm90 {
 
     static constexpr int Flashmask_n_block_buffer_length = ((Flashmask_max_seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4 + 4;
     static constexpr int Flashmask_n_block_buffer_valid_length = Flashmask_n_block_buffer_length - 4;
+    //xhy : now only support blockmask blocksize == 128
+    static constexpr int Blockmask_n_block_buffer_valid_length = (Flashmask_n_block_buffer_valid_length * kBlockN) / 128;
 
     static constexpr int Flashmask_n_block_chunk_end = -1;
     static constexpr int Flashmask_n_block_finish = -2;
@@ -433,6 +435,9 @@ struct CollectiveMainloopFwdSm90 {
 
         int32_t * __restrict__ const ut_end_nblockmax = nullptr;
         int32_t * __restrict__ const ut_end_nblockmin = nullptr;
+
+        int m_block_dim,n_block_dim;
+        int32_t * __restrict__ block_mask_ptr = nullptr;
     };
 
     // Device side kernel params
@@ -512,6 +517,10 @@ struct CollectiveMainloopFwdSm90 {
 
         int * __restrict__ const ut_end_nblockmax = nullptr;
         int * __restrict__ const ut_end_nblockmin = nullptr;
+
+        int m_block_dim,n_block_dim;
+        int m_factor, n_factor;
+        int32_t * __restrict__ block_mask_ptr = nullptr;
     };
 
     static Params
@@ -596,6 +605,15 @@ struct CollectiveMainloopFwdSm90 {
             assert(page_size % kBlockN == 0);
             assert(!args.leftpad_k);
         }
+
+        //block sparse attn
+        assert(std::get<1>(args.shape_Q) % args.m_block_dim == 0);
+        assert(std::get<1>(args.shape_K) % args.n_block_dim == 0);
+        assert(args.m_block_dim % kBlockM == 0);
+        assert(args.n_block_dim % kBlockN == 0);
+        int m_factor = args.m_block_dim / kBlockM;
+        int n_factor = args.n_block_dim / kBlockN;
+
         // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         // Right after this, we multiply by log2(e) before applying exp2.
         // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
@@ -628,7 +646,10 @@ struct CollectiveMainloopFwdSm90 {
                 args.lt_start_nblockmax, args.lt_start_nblockmin,
                 args.lt_end_nblockmax, args.lt_end_nblockmin,
                 args.ut_start_nblockmax, args.ut_start_nblockmin,
-                args.ut_end_nblockmax, args.ut_end_nblockmin};
+                args.ut_end_nblockmax, args.ut_end_nblockmin,
+                args.m_block_dim,args.n_block_dim,
+                m_factor,n_factor,
+                args.block_mask_ptr};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -656,7 +677,8 @@ struct CollectiveMainloopFwdSm90 {
                  SeqlenInfo_t const& seqlen_info,
                  cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
                  int32_t reverse_chunk_idx, // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0]
-                 int32_t* const flashmask_maxmin_smem) {
+                 int32_t* const flashmask_maxmin_smem,
+                 int32_t* block_mask_smem ) {
         int32_t bidh = get<1>(block_coord);
         int32_t bidb = get<2>(block_coord);
         int const m_block = get<0>(block_coord);
@@ -666,11 +688,19 @@ struct CollectiveMainloopFwdSm90 {
         int offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * nblock_seqlen; // row_offset
         offset += std::max((nblock_seqlen - (reverse_chunk_idx + 1) * Flashmask_n_block_buffer_valid_length), 0);
 
+        const int valid_block_nblock_seqlen = (seqlen_info.seqlen_k + params.n_block_dim - 1) / params.n_block_dim ; //xhy :maybe nblock_seqlen - 4
+        const int valid_block_mblock_seqlen = (seqlen_info.seqlen_q + params.m_block_dim - 1) / params.m_block_dim;
+
+        int blockmask_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * valid_block_nblock_seqlen * valid_block_mblock_seqlen; // row_offset
+        blockmask_offset += m_block * valid_block_nblock_seqlen / params.m_factor;
+        blockmask_offset += std::max((valid_block_nblock_seqlen - (reverse_chunk_idx + 1) * Blockmask_n_block_buffer_valid_length), 0);
+
         constexpr int threads_num = 96;
         static_assert(threads_num == 96, "load_max_min only support running with 3 warp");
         int const thread_idx = threadIdx.x - 32;
 
-       int length  = Flashmask_n_block_buffer_valid_length < nblock_seqlen ? Flashmask_n_block_buffer_valid_length : nblock_seqlen;
+        int length  = Flashmask_n_block_buffer_valid_length < nblock_seqlen ? Flashmask_n_block_buffer_valid_length : nblock_seqlen;
+        int blockmask_length = Blockmask_n_block_buffer_valid_length < valid_block_nblock_seqlen ? Blockmask_n_block_buffer_valid_length : valid_block_nblock_seqlen;
 
         // how to fix oob?
         for(int64_t idx = thread_idx; idx < length / 4 && (offset + idx * 4) >= 0; idx += threads_num) {
@@ -793,6 +823,26 @@ struct CollectiveMainloopFwdSm90 {
                   "n"(4));
         }
 
+        if(params.block_mask_ptr != nullptr){
+            for(int64_t idx = thread_idx; idx < blockmask_length / 4 && (offset + idx * 4) >= 0; idx += threads_num) {
+                asm volatile(
+                "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                    ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(block_mask_smem) + idx)),
+                    "l"(reinterpret_cast<int4*>(params.block_mask_ptr + blockmask_offset) + idx),
+                    "n"(16));
+            }
+        }
+        if(params.block_mask_ptr != nullptr){
+            for(int64_t idx = thread_idx + blockmask_length / 4 * 4; idx < blockmask_length && (offset + idx >= 0); idx += threads_num) {
+            // lt
+            
+                asm volatile(
+                "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                    ::"r"(cutlass::arch::cutlass_get_smem_pointer(block_mask_smem + idx)),
+                    "l"(params.block_mask_ptr + blockmask_offset + idx),
+                    "n"(4));
+            }
+        }
         asm volatile("cp.async.commit_group;\n" ::);
         asm volatile("cp.async.wait_group 0;\n" ::);
 
@@ -807,7 +857,8 @@ struct CollectiveMainloopFwdSm90 {
                      int32_t end_flag,
                      int32_t* const flashmask_maxmin_smem,
                      int32_t* const n_block_smem_,
-                     bool* const partially_masked_smem_) {
+                     bool* const partially_masked_smem_,
+                     int32_t* const block_mask_smem) {
       int const m_block = get<0>(block_coord);
       int const bidh = get<1>(block_coord);
       int const bidb = get<2>(block_coord);
@@ -854,6 +905,7 @@ struct CollectiveMainloopFwdSm90 {
 
       int32_t base_offset = std::max(nblock_seqlen - (reverse_chunk_idx + 1) * Flashmask_n_block_buffer_valid_length, 0);
 
+      bool is_block_masked = params.block_mask_ptr != nullptr;
       // explanation for the loop condition:
       // -2, -1,  0,  1,  2
       // t4, t3, t2, t1, t0
@@ -900,6 +952,10 @@ struct CollectiveMainloopFwdSm90 {
               partially_masked = true;
           else
               partially_masked = false;
+          if(is_block_masked && !block_mask_smem[idx / params.n_factor]){
+              prefix_sum = 0;
+              fully_masked = true;            
+          }
         }
 
         // warp-wide prefix-sum
