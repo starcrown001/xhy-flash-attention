@@ -673,7 +673,6 @@ struct CollectiveMainloopFwdSm90 {
         int32_t bidb = get<2>(block_coord);
         const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4; // umiswing: padding for int4 load
 
-        // row_offset
         const int offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * nblock_seqlen +
             std::max((nblock_seqlen - (reverse_chunk_idx + 1) * Flashmask_n_block_buffer_valid_length), 0);
 
@@ -697,18 +696,11 @@ struct CollectiveMainloopFwdSm90 {
                     reinterpret_cast<int4*>(flashmask_maxmin_smem) + Flashmask_n_block_buffer_length / 4 * index + idx)),   \
                   "l"(reinterpret_cast<int4*>(params.src_ptr + offset) + idx),                                              \
                   "n"(16))
-        
-        #define CP_ASYNC_SMEM(src_ptr, index)                                                   \
-            asm volatile(                                                                       \
-              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"                            \
-                ::"r"(cutlass::arch::cutlass_get_smem_pointer(                                  \
-                    flashmask_maxmin_smem + Flashmask_n_block_buffer_length * index + idx)),    \
-                  "l"(params.src_ptr + offset + idx),                                           \
-                  "n"(4))
 
+        // Note(heqianyue): we make sure that length is the multiple of 4. If this constraint does not hold in the future
+        // one can refer to d0659db5c7 and re-implement the loading of remaining elements
         if (tag == PtrExistDispatchTag::FULL_PTR) {
-            // how to fix oob?
-            for(int64_t idx = thread_idx; idx < length / 4; idx += ProducerThreadNum) {
+            for(int64_t idx = thread_idx; idx * 4 < length; idx += ProducerThreadNum) {
                 // lt start is always valid in flashmask (otherwise it is a bug)
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmax, 0);
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmin, 1);
@@ -720,19 +712,8 @@ struct CollectiveMainloopFwdSm90 {
                 CP_ASYNC_SMEM_INT4(ut_end_nblockmax, 6);
                 CP_ASYNC_SMEM_INT4(ut_end_nblockmin, 7);
             }
-            for(int64_t idx = thread_idx + (length & 0xfffffffc); idx < length; idx += ProducerThreadNum) {
-                CP_ASYNC_SMEM(lt_start_nblockmax, 0);
-                CP_ASYNC_SMEM(lt_start_nblockmin, 1);
-                CP_ASYNC_SMEM(lt_end_nblockmax, 2);
-                CP_ASYNC_SMEM(lt_end_nblockmin, 3);
-
-                CP_ASYNC_SMEM(ut_start_nblockmax, 4);
-                CP_ASYNC_SMEM(ut_start_nblockmin, 5);
-                CP_ASYNC_SMEM(ut_end_nblockmax, 6);
-                CP_ASYNC_SMEM(ut_end_nblockmin, 7);
-            }
         } else if (tag == PtrExistDispatchTag::DUAL_PTR) {
-            for(int64_t idx = thread_idx; idx < length / 4; idx += ProducerThreadNum) {
+            for(int64_t idx = thread_idx; 4 * idx < length; idx += ProducerThreadNum) {
                 // lt start is always valid in flashmask (otherwise it is a bug)
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmax, 0);
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmin, 1);
@@ -745,31 +726,14 @@ struct CollectiveMainloopFwdSm90 {
                     CP_ASYNC_SMEM_INT4(ut_end_nblockmin, 7);
                 }   
             }
-            for(int64_t idx = thread_idx + (length & 0xfffffffc); idx < length; idx += ProducerThreadNum) {
-                CP_ASYNC_SMEM(lt_start_nblockmax, 0);
-                CP_ASYNC_SMEM(lt_start_nblockmin, 1);
-                // check: paddle/phi/kernels/gpu/flash_attn_v3_kernel.cu (#L2073-L2119)
-                if constexpr (Is_causal) {
-                    CP_ASYNC_SMEM(lt_end_nblockmax, 2);
-                    CP_ASYNC_SMEM(lt_end_nblockmin, 3);
-                } else {
-                    CP_ASYNC_SMEM(ut_end_nblockmax, 6);
-                    CP_ASYNC_SMEM(ut_end_nblockmin, 7);
-                }   
-            }
         } else {
-            for(int64_t idx = thread_idx; idx < length / 4; idx += ProducerThreadNum) {
+            for(int64_t idx = thread_idx; 4 * idx < length; idx += ProducerThreadNum) {
                 // lt start is always valid in flashmask (otherwise it is a bug)
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmax, 0);
                 CP_ASYNC_SMEM_INT4(lt_start_nblockmin, 1);
             }
-            for(int64_t idx = thread_idx + (length & 0xfffffffc); idx < length; idx += ProducerThreadNum) {
-                CP_ASYNC_SMEM(lt_start_nblockmax, 0);
-                CP_ASYNC_SMEM(lt_start_nblockmin, 1);
-            }
         }
         #undef CP_ASYNC_SMEM_INT4
-        #undef CP_ASYNC_SMEM
 
         asm volatile("cp.async.commit_group;\n" ::);
         asm volatile("cp.async.wait_group 0;\n" ::);
@@ -889,7 +853,6 @@ struct CollectiveMainloopFwdSm90 {
             prefix_sum = int(!fully_masked);
         }
 
-        // Be careful, following two lines might increase reg count
         const int warp_id_ = thread_idx >> 5;
         const int lane_id_ = thread_idx & 31;
         // warp-wide prefix-sum
@@ -1293,7 +1256,6 @@ struct CollectiveMainloopFwdSm90 {
         }
         int n_block_prev = n_block;
 
-        // I know what the problem is. We might accidentally extract end or finish without knowing
         n_block = n_block_getter(++n_block_idx);
 
         #pragma unroll (!Transpose_V && Use_TMA_KV ? 2 : 1)
