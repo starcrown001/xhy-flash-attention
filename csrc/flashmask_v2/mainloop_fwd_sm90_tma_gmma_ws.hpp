@@ -73,11 +73,12 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
-    static constexpr int Flashmask_max_seqlen_k = 1024 * 16;        // scheduler pipelining needs to cut smem in half
+    static constexpr int Flashmask_max_seqlen_k = 1024 * 16;    // scheduler pipelining needs to cut smem in half
     static constexpr int ProducerThreadNum = 96;
 
-    static constexpr int Flashmask_n_block_buffer_length = ((Flashmask_max_seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4 + 4;
-    static constexpr int Flashmask_n_block_buffer_valid_length = Flashmask_n_block_buffer_length - 4;
+    // Flashmask_n_block_buffer_length is the multiple of 32 for 128B excessive-sector-free load/store
+    static constexpr int Flashmask_n_block_buffer_length = ((Flashmask_max_seqlen_k + kBlockN - 1) / kBlockN + 31) & 0xffffffe0;
+    static constexpr int Flashmask_n_block_buffer_valid_length = ((Flashmask_max_seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4;
 
     // Using bool in smem will usually lead to 4-way bank conflict, in order to accelerate this func
     // we encode `partially_masked` flags in `n_block_smem`, which both saved some smem, while eliminating 4-way bank conflict
@@ -667,17 +668,22 @@ struct CollectiveMainloopFwdSm90 {
                  SeqlenInfo_t const& seqlen_info,
                  cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
                  int32_t reverse_chunk_idx, // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0]
+                 int32_t total_num_chunks,
                  int32_t* const flashmask_maxmin_smem) {
 
         int32_t bidh = get<1>(block_coord);
         int32_t bidb = get<2>(block_coord);
-        const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4; // umiswing: padding for int4 load
+        // pad for fully 128B aligned load
+        const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc;
 
-        const int offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * nblock_seqlen +
-            std::max((nblock_seqlen - (reverse_chunk_idx + 1) * Flashmask_n_block_buffer_valid_length), 0);
+        // change this to num_chunk * chunk_size (should be Flashmask_n_block_buffer_length)
+        const int chunks_size = total_num_chunks * Flashmask_n_block_buffer_length;
+
+        const int offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * chunks_size +
+                    (chunks_size - (reverse_chunk_idx + 1) * Flashmask_n_block_buffer_length);
 
         const int thread_idx = threadIdx.x - 32;
-        const int length  = Flashmask_n_block_buffer_valid_length < nblock_seqlen ? Flashmask_n_block_buffer_valid_length : nblock_seqlen;
+        const int length = Flashmask_n_block_buffer_valid_length < nblock_seqlen ? Flashmask_n_block_buffer_valid_length : nblock_seqlen;
 
         // it's a pity that tag cannot have static dispatch, since load_max_min should remain the same
         // across different main loop implementation. We can implement a func with default 
@@ -747,9 +753,11 @@ struct CollectiveMainloopFwdSm90 {
                      SeqlenInfo_t const& seqlen_info,
                      cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
                      int32_t reverse_chunk_idx, // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0]
+                     int32_t total_num_chunks,
                      int32_t end_flag,
                      int32_t* const flashmask_maxmin_smem,
-                     int32_t* const mask_encode_n_block_smem_) {
+                     int32_t* const mask_encode_n_block_smem_,
+                     int32_t* const extra_flags) {
       int m_block = get<0>(block_coord);
       int const bidb = get<2>(block_coord);
       int const split_idx = get<3>(block_coord);
@@ -802,9 +810,7 @@ struct CollectiveMainloopFwdSm90 {
       }
       
       int32_t valid_n_block_num = 0;
-
-      const int32_t nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4; // umiswing: padding for int4 load
-      const int32_t base_offset = std::max(nblock_seqlen - (reverse_chunk_idx + 1) * Flashmask_n_block_buffer_valid_length, 0);
+      const int32_t base_offset = (total_num_chunks - 1 - reverse_chunk_idx) * Flashmask_n_block_buffer_valid_length;
 
       // explanation for the loop condition:
       // -2, -1,  0,  1,  2
@@ -885,7 +891,11 @@ struct CollectiveMainloopFwdSm90 {
         valid_n_block_num += s_prefix_sum[2];
         cutlass::arch::NamedBarrier::sync(ProducerThreadNum, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
       }
-      mask_encode_n_block_smem_[valid_n_block_num] = end_flag;
+      // Do not allocate buffer length that is not the multiple of 32 (otherwise there will be global excessive sectors)
+      if (valid_n_block_num < Flashmask_n_block_buffer_valid_length)
+        mask_encode_n_block_smem_[valid_n_block_num] = end_flag;
+      else
+        *extra_flags = end_flag;
       return valid_n_block_num != 0 || end_flag != Flashmask_n_block_chunk_end;
     }
 
@@ -904,7 +914,8 @@ struct CollectiveMainloopFwdSm90 {
          cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
          int &work_idx,
          int32_t* const flashmask_smem_,
-         const int32_t* const n_block_smem
+         const int32_t* const n_block_smem,
+         const int32_t* const extra_flags
          ) {
         // some of these are captured in lambda so can't use structured binding
         int const m_block = get<0>(block_coord);
@@ -1101,12 +1112,13 @@ struct CollectiveMainloopFwdSm90 {
         int32_t n_block_idx = 0;
 
         const int32_t* mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+        const int32_t* extra_flags_smem = extra_flags + n_block_pipe_read.index();
 
         auto load_flashmask = [&] (auto const& smem_pipe_write) {
             if constexpr (Is_flashmask) {
                 pipeline_flashmask_apply.producer_acquire(smem_pipe_write);
                 int32_t* const flashmask_base_addr = flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN;
-                if(mask_encode_n_block_smem_[n_block_idx] >= 0) {
+                if(n_block_idx < Flashmask_n_block_buffer_valid_length && mask_encode_n_block_smem_[n_block_idx] >= 0) {
                   const int row_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen_info.seqlen_k;
                   const int nb_mul_kBN = n_block * kBlockN;
                   const int loop_ub = std::min(kBlockN, seqlen_info.seqlen_k - nb_mul_kBN);
@@ -1173,12 +1185,16 @@ struct CollectiveMainloopFwdSm90 {
             pipeline.consumer_wait(smem_pipe_read, barrier_token);
         };
 
-        auto n_block_getter = [&mask_encode_n_block_smem_](int32_t index) {
+        auto n_block_getter = [&mask_encode_n_block_smem_, &extra_flags_smem](int32_t index) {
             // if val >= 0 or val in [end, finish]: return val, else: return -val - 1
-            const int32_t encoded = mask_encode_n_block_smem_[index];
-            const int32_t mask = -static_cast<int>(encoded <= INT_MIN + 1);     // INT_MIN is Flashmask_n_block_chunk_end
-            const int32_t converted = encoded ^ (encoded >> 31);
-            return (converted & ~mask) | (encoded & mask);
+            if (index < Flashmask_n_block_buffer_valid_length) {
+                const int32_t encoded = mask_encode_n_block_smem_[index];
+                const int32_t mask = -static_cast<int>(encoded <= INT_MIN + 1);     // INT_MIN is Flashmask_n_block_chunk_end
+                const int32_t converted = encoded ^ (encoded >> 31);
+                return (converted & ~mask) | (encoded & mask);
+            } else {
+                return *extra_flags_smem;
+            }
         };
 
         n_block_wait(pipeline_n_block, n_block_pipe_read);
@@ -1291,6 +1307,7 @@ struct CollectiveMainloopFwdSm90 {
             ++n_block_pipe_read;
             n_block_wait(pipeline_n_block, n_block_pipe_read);
             mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+            extra_flags_smem = extra_flags + n_block_pipe_read.index();
             n_block_idx = 0;
             n_block = n_block_getter(0);
           }
@@ -1465,7 +1482,8 @@ struct CollectiveMainloopFwdSm90 {
         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage,
         int32_t* const flashmask_smem_,
-        const int32_t* const n_block_smem
+        const int32_t* const n_block_smem,
+        const int32_t* const extra_flags
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -1565,14 +1583,19 @@ struct CollectiveMainloopFwdSm90 {
 
         consumer_wait(pipeline_n_block, n_block_pipe_read);
         const int32_t* mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+        const int32_t* extra_flags_smem = extra_flags + n_block_pipe_read.index();
 
         int n_block_idx = 0;
-        auto n_block_getter = [&mask_encode_n_block_smem_](int32_t index) {
+        auto n_block_getter = [&mask_encode_n_block_smem_, &extra_flags_smem](int32_t index) {
             // if val >= 0 or val in [end, finish]: return val, else: return -val - 1
-            const int32_t encoded = mask_encode_n_block_smem_[index];
-            const int32_t mask = -static_cast<int>(encoded <= INT_MIN + 1);     // INT_MIN is Flashmask_n_block_chunk_end
-            const int32_t converted = encoded ^ (encoded >> 31);
-            return (converted & ~mask) | (encoded & mask);
+            if (index < Flashmask_n_block_buffer_valid_length) {
+                const int32_t encoded = mask_encode_n_block_smem_[index];
+                const int32_t mask = -static_cast<int>(encoded <= INT_MIN + 1);     // INT_MIN is Flashmask_n_block_chunk_end
+                const int32_t converted = encoded ^ (encoded >> 31);
+                return (converted & ~mask) | (encoded & mask);
+            } else {
+                return *extra_flags_smem;
+            }
         };
         n_block = n_block_getter(0);
 
@@ -1674,7 +1697,7 @@ struct CollectiveMainloopFwdSm90 {
 
             if constexpr(Is_flashmask) {
               consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
-              if (mask_encode_n_block_smem_[n_block_idx] >= 0) {
+              if (n_block_idx < Flashmask_n_block_buffer_valid_length && mask_encode_n_block_smem_[n_block_idx] >= 0) {
                 if (params.ut_start_ptr) {
                     flashmask_apply<TiledMmaQK, PtrExistDispatchTag::FULL_PTR>(
                                 tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_,
@@ -1741,7 +1764,7 @@ struct CollectiveMainloopFwdSm90 {
 
                 if constexpr (Is_flashmask) {
                   consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
-                  if (mask_encode_n_block_smem_[n_block_idx] >= 0) {
+                  if (n_block_idx < Flashmask_n_block_buffer_valid_length && mask_encode_n_block_smem_[n_block_idx] >= 0) {
                     if (params.ut_start_ptr) {
                         flashmask_apply<TiledMmaQK, PtrExistDispatchTag::FULL_PTR>(
                                     tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_,
@@ -1795,6 +1818,7 @@ struct CollectiveMainloopFwdSm90 {
                     ++n_block_pipe_read;
                     consumer_wait(pipeline_n_block, n_block_pipe_read);
                     mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+                    extra_flags_smem = extra_flags + n_block_pipe_read.index();
                     n_block_idx = 0;
                     n_block = n_block_getter(0);
                   }
@@ -1812,6 +1836,7 @@ struct CollectiveMainloopFwdSm90 {
                 ++n_block_pipe_read;
                 consumer_wait(pipeline_n_block, n_block_pipe_read);
                 mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+                extra_flags_smem = extra_flags + n_block_pipe_read.index();
                 n_block_idx = 0;
                 n_block = n_block_getter(0);
               }
@@ -1830,6 +1855,7 @@ struct CollectiveMainloopFwdSm90 {
                     ++n_block_pipe_read;
                     consumer_wait(pipeline_n_block, n_block_pipe_read);
                     mask_encode_n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
+                    extra_flags_smem = extra_flags + n_block_pipe_read.index();
                     n_block_idx = 0;
                     n_block = n_block_getter(0);
                   }

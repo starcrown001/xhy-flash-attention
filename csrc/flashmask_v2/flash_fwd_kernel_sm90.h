@@ -213,8 +213,10 @@ public:
 
         static constexpr int num_sch_stage = Use_Sch_Pipeline ? 2 : 1;
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
-        __shared__ __align__(16) int32_t flashmask_maxmin_smem[num_sch_stage * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        __shared__ __align__(128) int32_t flashmask_maxmin_smem[num_sch_stage * 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
         __shared__ int32_t n_block_smem[num_sch_stage * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        // When n_block_smem is full, we need to store the flag in the following extra flag storage, instead of allocating 4 more elements
+        __shared__ int32_t extra_flags[4];   // if num_sch_stage is 1, we actually only need two (kNBlockStages = 2)
 
         if constexpr (Use_Sch_Pipeline) {
             if (threadIdx.x < 2) {
@@ -299,9 +301,10 @@ public:
                       continue;
                   }
               }
-
-              const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4; // umiswing: padding for int4 load
-              const int num_chunk = (nblock_seqlen + CollectiveMainloop::Flashmask_n_block_buffer_valid_length -1) / CollectiveMainloop::Flashmask_n_block_buffer_valid_length;
+              
+              // for padding 32 and padding 4: the num_chunk (pad_32) >= num_chunk (pad_4) is always true
+              const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) & 0xfffffffc; // umiswing: padding for int4 load
+              const int num_chunk = (nblock_seqlen + CollectiveMainloop::Flashmask_n_block_buffer_valid_length - 1) / CollectiveMainloop::Flashmask_n_block_buffer_valid_length;
               // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0], and fwd kernel scans from right to left
               bool valid_chunk = true;
               const int cppl_stage = scheduler.template stage<true>();      // coarse pipeline stage (offset, 0 or 2)
@@ -311,14 +314,15 @@ public:
                             seqlen_info,                                                                                                                        \
                             block_coord,                                                                                                                        \
                             reverse_chunk_idx,                                                                                                                  \
+                            num_chunk,                                                                                                                          \
                             reverse_chunk_idx == num_chunk - 1 ? CollectiveMainloop::Flashmask_n_block_finish : CollectiveMainloop::Flashmask_n_block_chunk_end,\
                             flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),        \
-                            n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage))
-
+                            n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage),                     \
+                            extra_flags + n_block_pipe_write.index() + cppl_stage)
               for(int reverse_chunk_idx = 0; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
                 if (valid_chunk)
                     pipeline_n_block.producer_acquire(n_block_pipe_write);
-                mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem +
+                mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, num_chunk, flashmask_maxmin_smem +
                                       8 * CollectiveMainloop::Flashmask_n_block_buffer_length * (n_block_pipe_write.index() + cppl_stage));
                 if (params.mainloop.ut_start_ptr) {
                     GEN_N_BLOCK_DISPATCH(CollectiveMainloop::PtrExistDispatchTag::FULL_PTR);
@@ -463,7 +467,8 @@ public:
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_write,
                               n_block_pipe_read,
                               shared_storage, seqlen_info, block_coord, work_idx,
-                              flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage());
+                              flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage(),
+                              extra_flags + scheduler.stage());
                 // coarse pipeline stage (offset, 0 or 2)
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
@@ -508,13 +513,15 @@ public:
                         params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_read,
                         n_block_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                        flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage());
+                        flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage(),
+                        extra_flags + scheduler.stage());
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
                             params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                            flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage());
+                            flashmask_smem_, n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * scheduler.stage(),
+                            extra_flags + scheduler.stage());
                     } else {
                         tile_valid = mainloop.mma_pv(
                             params.mainloop, pipeline_v, pipeline_n_block, smem_pipe_read,
