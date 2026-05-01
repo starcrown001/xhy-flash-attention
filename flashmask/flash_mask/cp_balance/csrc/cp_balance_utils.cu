@@ -106,82 +106,71 @@ __global__ void reduce_workload_kernel(
     const int* UTEndMax, const int* UTEndMin,
     int* workload, // [B, H, Tr, 1]
     int BH, int Tr, int Tc, int S,
-    int Br // m_block_size
+    int Br, // m_block_size
+    int partially_masked_weight,
+    int unmasked_weight
 ) {
-    int bh = blockIdx.y;
-    int tr = blockIdx.x;
-    int tc = threadIdx.x;
-    int warpId = threadIdx.x / 32;
-    int laneId = threadIdx.x % 32;
+    const int bh = blockIdx.y;
+    const int tr = blockIdx.x;
+    const int warpId = threadIdx.x / 32;
+    const int laneId = threadIdx.x % 32;
 
-    if(tr >= Tr) return;
+    if (tr >= Tr) return;
 
-    int wl = 0;
-    bool fully_masked = true;
-    bool partially_masked = false;
-    int lt_start_max = INT_MAX;
-    int lt_start_min = INT_MAX;
-    int lt_end_max = INT_MAX;
-    int lt_end_min = INT_MAX;
-    int ut_start_max = INT_MIN;
-    int ut_start_min = INT_MIN;
-    int ut_end_max = INT_MIN;
-    int ut_end_min = INT_MIN;
-
-    __shared__ int smem[32];
-
-    const int idx = bh * Tc + tc;
-    const int q_idx = bh * Tr + tr;
-
-    // m_block_s/e: Q block boundaries within a single (batch, head) — use tr only, not q_idx.
-    // q_idx includes the bh offset for output indexing, but mask values are in [0, S) per (b,h).
+    // m_block_s/e: Q block boundaries within a single (batch, head).
     const int m_block_s = tr * kBlockM;
     const int m_block_e = m_block_s + kBlockM < S ? m_block_s + kBlockM : S;
 
-    lt_start_max = tc < Tc ? LTStartMax[idx] : INT_MAX;
-    lt_start_min = tc < Tc ? LTStartMin[idx] : INT_MAX;
+    const int bh_offset = bh * Tc;
+    const int q_idx = bh * Tr + tr;
 
-    // 分支展开
-    if constexpr (PTR_DISPATCH_TAG == FULL_PTR) {
-        lt_end_max = tc < Tc ? LTEndMax[idx] : INT_MAX;
-        lt_end_min = tc < Tc ? LTEndMin[idx] : INT_MAX;
-        ut_start_max = tc < Tc ? UTStartMax[idx] : INT_MIN;
-        ut_start_min = tc < Tc ? UTStartMin[idx] : INT_MIN;
-        ut_end_max = tc < Tc ? UTEndMax[idx] : INT_MIN;
-        ut_end_min = tc < Tc ? UTEndMin[idx] : INT_MIN;
+    // Stride loop: 每个 thread 处理 tc = threadIdx.x, threadIdx.x + blockDim.x, ...
+    int thread_wl = 0;
+    for (int tc = static_cast<int>(threadIdx.x); tc < Tc; tc += static_cast<int>(blockDim.x)) {
+        const int idx = bh_offset + tc;
 
-        fully_masked = (m_block_s >= lt_start_max && m_block_e <= lt_end_min) ||
-                       (m_block_s >= ut_start_max && m_block_e <= ut_end_min);
-        partially_masked = (m_block_s < lt_end_max && m_block_e > lt_start_min) ||
-                           (m_block_s < ut_end_max && m_block_e > ut_start_min);
-    }
-    else if constexpr (PTR_DISPATCH_TAG == DUAL_PTR) {
-        if constexpr (is_causal) {
-            lt_end_max = tc < Tc ? LTEndMax[idx] : INT_MAX;
-            lt_end_min = tc < Tc ? LTEndMin[idx] : INT_MAX;
-            fully_masked = m_block_s >= lt_start_max && m_block_e <= lt_end_min;
-            partially_masked = m_block_s < lt_end_max && m_block_e > lt_start_min;
-        } else {
-            ut_end_max = tc < Tc ? UTEndMax[idx] : INT_MIN;
-            ut_end_min = tc < Tc ? UTEndMin[idx] : INT_MIN;
-            fully_masked = (m_block_s >= lt_start_max) || (m_block_e <= ut_end_min);
-            partially_masked = (m_block_e > lt_start_min) || (m_block_s < ut_end_max);
+        int lt_start_max_val = LTStartMax[idx];
+        int lt_start_min_val = LTStartMin[idx];
+        bool fully_masked = true;
+        bool partially_masked = false;
+
+        if constexpr (PTR_DISPATCH_TAG == FULL_PTR) {
+            int lt_end_max_val = LTEndMax[idx];
+            int lt_end_min_val = LTEndMin[idx];
+            int ut_start_max_val = UTStartMax[idx];
+            int ut_start_min_val = UTStartMin[idx];
+            int ut_end_max_val = UTEndMax[idx];
+            int ut_end_min_val = UTEndMin[idx];
+            fully_masked = (m_block_s >= lt_start_max_val && m_block_e <= lt_end_min_val) ||
+                           (m_block_s >= ut_start_max_val && m_block_e <= ut_end_min_val);
+            partially_masked = (m_block_s < lt_end_max_val && m_block_e > lt_start_min_val) ||
+                               (m_block_s < ut_end_max_val && m_block_e > ut_start_min_val);
         }
-    }
-    else if constexpr (PTR_DISPATCH_TAG == SINGLE_PTR) {
-        fully_masked = m_block_s >= lt_start_max;
-        partially_masked = m_block_e > lt_start_min;
+        else if constexpr (PTR_DISPATCH_TAG == DUAL_PTR) {
+            if constexpr (is_causal) {
+                int lt_end_max_val = LTEndMax[idx];
+                int lt_end_min_val = LTEndMin[idx];
+                fully_masked = m_block_s >= lt_start_max_val && m_block_e <= lt_end_min_val;
+                partially_masked = m_block_s < lt_end_max_val && m_block_e > lt_start_min_val;
+            } else {
+                int ut_end_max_val = UTEndMax[idx];
+                int ut_end_min_val = UTEndMin[idx];
+                fully_masked = (m_block_s >= lt_start_max_val) || (m_block_e <= ut_end_min_val);
+                partially_masked = (m_block_e > lt_start_min_val) || (m_block_s < ut_end_max_val);
+            }
+        }
+        else if constexpr (PTR_DISPATCH_TAG == SINGLE_PTR) {
+            fully_masked = m_block_s >= lt_start_max_val;
+            partially_masked = m_block_e > lt_start_min_val;
+        }
+
+        thread_wl += fully_masked ? 0 : (partially_masked ? partially_masked_weight : unmasked_weight);
     }
 
-    if(tc >= Tc){
-        fully_masked = true;
-        partially_masked = false;
-    }
-    wl = fully_masked ? 0 : 1;
-
-    unsigned mask = 0xffffffff;
-    // warp reduce sum
-    int wl_sum = wl;
+    // Warp reduce sum
+    __shared__ int smem[32];
+    const unsigned mask = 0xffffffff;
+    int wl_sum = thread_wl;
     for (int offset = 16; offset > 0; offset >>= 1) {
         wl_sum += __shfl_down_sync(mask, wl_sum, offset);
     }
@@ -190,8 +179,9 @@ __global__ void reduce_workload_kernel(
     }
     __syncthreads();
 
+    // Final reduce across warps (first warp collects)
     if (threadIdx.x < 32) {
-        int val = (threadIdx.x < (blockDim.x + 31)/32) ? smem[threadIdx.x] : 0;
+        int val = (threadIdx.x < (blockDim.x + 31) / 32) ? smem[threadIdx.x] : 0;
         for (int offset = 16; offset > 0; offset >>= 1) {
             val += __shfl_down_sync(mask, val, offset);
         }
@@ -409,6 +399,8 @@ void launch_reduce_workload_kernel(
     int stride,
     int row_block_size,
     bool is_causal,
+    int partially_masked_weight,
+    int unmasked_weight,
     cudaStream_t stream) {
     
     dim3 block_dim(1024, 1);
@@ -436,24 +428,24 @@ void launch_reduce_workload_kernel(
         reduce_workload_kernel<kBlockM, FULL_PTR, false><<<grid_dim, block_dim, 0, stream>>>(
             lt_start_max_ptr, lt_start_min_ptr, lt_end_max_ptr, lt_end_min_ptr,
             ut_start_max_ptr, ut_start_min_ptr, ut_end_max_ptr, ut_end_min_ptr,
-            workload_ptr, batch_times_heads, num_row_blocks, num_col_blocks, stride, row_block_size);
+            workload_ptr, batch_times_heads, num_row_blocks, num_col_blocks, stride, row_block_size, partially_masked_weight, unmasked_weight);
     } else if (ptr_dispatch_tag == DUAL_PTR) {
         if (is_causal) {
             reduce_workload_kernel<kBlockM, DUAL_PTR, true><<<grid_dim, block_dim, 0, stream>>>(
                 lt_start_max_ptr, lt_start_min_ptr, lt_end_max_ptr, lt_end_min_ptr,
                 ut_start_max_ptr, ut_start_min_ptr, ut_end_max_ptr, ut_end_min_ptr,
-                workload_ptr, batch_times_heads, num_row_blocks, num_col_blocks, stride, row_block_size);
+                workload_ptr, batch_times_heads, num_row_blocks, num_col_blocks, stride, row_block_size, partially_masked_weight, unmasked_weight);
         } else {
             reduce_workload_kernel<kBlockM, DUAL_PTR, false><<<grid_dim, block_dim, 0, stream>>>(
                 lt_start_max_ptr, lt_start_min_ptr, lt_end_max_ptr, lt_end_min_ptr,
                 ut_start_max_ptr, ut_start_min_ptr, ut_end_max_ptr, ut_end_min_ptr,
-                workload_ptr, batch_times_heads, num_row_blocks, num_col_blocks, stride, row_block_size);
+                workload_ptr, batch_times_heads, num_row_blocks, num_col_blocks, stride, row_block_size, partially_masked_weight, unmasked_weight);
         }
     } else if (ptr_dispatch_tag == SINGLE_PTR) {
         reduce_workload_kernel<kBlockM, SINGLE_PTR, false><<<grid_dim, block_dim, 0, stream>>>(
             lt_start_max_ptr, lt_start_min_ptr, lt_end_max_ptr, lt_end_min_ptr,
             ut_start_max_ptr, ut_start_min_ptr, ut_end_max_ptr, ut_end_min_ptr,
-            workload_ptr, batch_times_heads, num_row_blocks, num_col_blocks, stride, row_block_size);
+            workload_ptr, batch_times_heads, num_row_blocks, num_col_blocks, stride, row_block_size, partially_masked_weight, unmasked_weight);
     } else {
         PD_THROW("Unknown pointer dispatch tag.");
     }
@@ -475,8 +467,10 @@ std::vector<paddle::Tensor> reduce_workload_cuda(
     int stride,
     int row_block_size,
     bool is_causal,
-    int m_block_size) {
-    
+    int m_block_size,
+    int partially_masked_weight,
+    int unmasked_weight) {
+
     const int kBlockM = m_block_size;
     const int batch_times_heads = batch_size * num_heads;
 
@@ -496,19 +490,19 @@ std::vector<paddle::Tensor> reduce_workload_cuda(
             launch_reduce_workload_kernel<64>(
                 lt_start_max, lt_start_min, lt_end_max, lt_end_min, ut_start_max,
                 ut_start_min, ut_end_max, ut_end_min, workload, batch_times_heads,
-                num_row_blocks, Tc_stride, stride, row_block_size, is_causal, stream);
+                num_row_blocks, Tc_stride, stride, row_block_size, is_causal, partially_masked_weight, unmasked_weight, stream);
             break;
         case 96:
             launch_reduce_workload_kernel<96>(
                 lt_start_max, lt_start_min, lt_end_max, lt_end_min, ut_start_max,
                 ut_start_min, ut_end_max, ut_end_min, workload, batch_times_heads,
-                num_row_blocks, Tc_stride, stride, row_block_size, is_causal, stream);
+                num_row_blocks, Tc_stride, stride, row_block_size, is_causal, partially_masked_weight, unmasked_weight, stream);
             break;
         case 128:
             launch_reduce_workload_kernel<128>(
                 lt_start_max, lt_start_min, lt_end_max, lt_end_min, ut_start_max,
                 ut_start_min, ut_end_max, ut_end_min, workload, batch_times_heads,
-                num_row_blocks, Tc_stride, stride, row_block_size, is_causal, stream);
+                num_row_blocks, Tc_stride, stride, row_block_size, is_causal, partially_masked_weight, unmasked_weight, stream);
             break;
         default:
             PD_THROW("Unsupported m_block_size: %d", kBlockM);
@@ -532,7 +526,9 @@ std::vector<paddle::Tensor> ReduceWorkloadOp(
     int stride,
     int row_block_size,
     bool is_causal,
-    int m_block_size) {
+    int m_block_size,
+    int partially_masked_weight,
+    int unmasked_weight) {
 #ifdef PADDLE_WITH_CUDA
     if (lt_start_max.is_gpu()) {
         return reduce_workload_cuda(lt_start_max,
@@ -550,7 +546,9 @@ std::vector<paddle::Tensor> ReduceWorkloadOp(
                                     stride,
                                     row_block_size,
                                     is_causal,
-                                    m_block_size);
+                                    m_block_size,
+                                    partially_masked_weight,
+                                    unmasked_weight);
     }
 #endif
     PD_THROW("Unsupported device: ReduceWorkload operator is only available for CUDA.");
@@ -660,7 +658,9 @@ PD_BUILD_OP(reduce_workload)
             "stride: int",
             "row_block_size: int",
             "is_causal: bool",
-            "m_block_size: int"})
+            "m_block_size: int",
+            "partially_masked_weight: int",
+            "unmasked_weight: int"})
     .SetKernelFn(PD_KERNEL(ReduceWorkloadOp));
 
 PD_BUILD_OP(indices_to_chunks)

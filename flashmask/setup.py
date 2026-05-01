@@ -38,7 +38,7 @@ from setuptools import setup as setuptools_setup, find_packages
 # ============================================================
 # Parse build mode
 # ============================================================
-FLASHMASK_BUILD = os.environ.get('FLASHMASK_BUILD', 'all').lower()
+FLASHMASK_BUILD = os.environ.get('FLASHMASK_BUILD', 'fa3').lower()
 assert FLASHMASK_BUILD in ('fa3', 'fa4', 'all'), (
     f"FLASHMASK_BUILD must be one of: fa3, fa4, all. Got: {FLASHMASK_BUILD}"
 )

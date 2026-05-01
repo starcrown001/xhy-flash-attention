@@ -30,7 +30,7 @@ def scanMaxMinChunkedKernel(input_tensor, Bc, B, H, S):
     return maxo, mino
 
 
-def reduce_workload(start_row_maxmin_indice_list, B, H, Tr, Tc, Br, S):
+def reduce_workload(start_row_maxmin_indice_list, B, H, Tr, Tc, Br, S, partially_masked_weight=2, unmasked_weight=1):
     (
         LTStartMax,
         LTStartMin,
@@ -44,7 +44,7 @@ def reduce_workload(start_row_maxmin_indice_list, B, H, Tr, Tc, Br, S):
 
     workload = cp_balance_ops.reduce_workload(
         LTStartMax, LTStartMin, LTEndMax, LTEndMin, UTStartMax, UTStartMin, UTEndMax, UTEndMin,
-        B, H, Tr, Tc, S, Br, False, 128
+        B, H, Tr, Tc, S, Br, False, 128, partially_masked_weight, unmasked_weight
     )
 
     return workload
@@ -58,3 +58,11 @@ def indices_rerank_cuda(startend_row_indices, indices, balance_chunk_size=2048):
     num_chunks = (S + balance_chunk_size - 1) // balance_chunk_size
     startend_row_indices_rerank = cp_balance_ops.indices_rerank(startend_row_indices, indices, B, H, S,D,num_chunks,balance_chunk_size)
     return startend_row_indices_rerank
+
+def cp_balance_ipo_solve(weights_np, M):
+    """调用 IPO 最优求解器。weights_np: 1-D int32 numpy, M: int。返回 (assign_matrix, max_load)。"""
+    import paddle
+    weights_t = paddle.to_tensor(weights_np, dtype='int32', place=paddle.CPUPlace())
+    assign_t, ml_t = cp_balance_ops.cp_balance_ipo(weights_t, M)
+    return assign_t.numpy(), ml_t.numpy().item()
+
