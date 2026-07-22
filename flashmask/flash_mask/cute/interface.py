@@ -348,6 +348,9 @@ def _flash_attn_fwd(
     lse: Optional[paddle.Tensor] = None,
     aux_tensors: Optional[list[paddle.Tensor]] = None,
     startend_row_indices: Optional[paddle.Tensor] = None,
+    block_logit: Optional[paddle.Tensor] = None,
+    block_size: int = 64,
+    block_bos: Optional[paddle.Tensor] = None,
 ) -> Tuple[paddle.Tensor, paddle.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -360,6 +363,22 @@ def _flash_attn_fwd(
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
+        block_logit: Optional pre-allocated fp32 tensor [batch, num_heads, seqlen_q, num_blocks] that,
+            when provided, receives the fused per-(query, key-block) max of the post-score_mod, post-mask,
+            SCALED logit `softmax_scale * q*k^T` (INCLUDING any score_mod bias) -- i.e. the exact value fed
+            into softmax. Storing the scaled logit puts every head on one head-independent scale, so a
+            downstream `block_logit - LSE` yields log(max attention weight in the block), which is comparable
+            across heads for cross-head Top-K block selection. Computed in the softmax epilogue and written in
+            place; kept out of the returned tuple. num_blocks must be >= ceil(seqlen_k / block_size). The fused
+            reduction respects the same causal / flashmask masking applied to the attention. Only supported on
+            SM 10.x (non split-KV).
+            IMPORTANT: the kernel only writes key-blocks that the attention loop actually visits. Key-blocks
+            that are entirely skipped by masking (e.g. fully-future blocks under causal / flashmask, or blocks
+            past seqlen_k when num_blocks*block_size > seqlen_k) are NEVER written. The caller MUST
+            pre-initialize block_logit to -inf so those entries read as -inf (masked) rather than stale
+            garbage; do not pass an uninitialized / reused buffer.
+        block_size: Key-block width (in tokens) used to bucket the fused block-logit reduction. Must divide
+            the kernel's n_block_size. Ignored when block_logit is None.
     """
 
     assert cu_seqlens_q is None, "cu_seqlens_q must be None (varlen is not supported in flashmask)"
@@ -700,6 +719,60 @@ def _flash_attn_fwd(
     else:
         lse_tensor = None
 
+    if block_logit is not None:
+        assert compute_capability == 10, (
+            "block_logit (fused block-score) is only supported on SM 10.x"
+        )
+        assert not is_split_kv, "block_logit is not supported with split-KV"
+        assert not pack_gqa, (
+            "block_logit requires pack_gqa=False. block_logit is indexed by the "
+            "query head (head_idx) and the query row (m_block*m_block_size+tidx); "
+            "under pack_gqa=True the query heads are packed into the M/row dim and "
+            "head_idx is the KV head, so the block-score write would target wrong "
+            "locations. NOTE: pack_gqa defaults to (qhead_per_kvhead > 1), so GQA "
+            "callers MUST pass pack_gqa=False explicitly when requesting block_logit."
+        )
+        assert block_logit.dtype == paddle.float32, (
+            f"block_logit must be float32; got {block_logit.dtype}"
+        )
+        assert block_logit.place.is_gpu_place(), "block_logit must be on CUDA"
+        assert block_logit.ndim == 4, (
+            f"block_logit must be [batch, num_heads, seqlen_q, num_blocks]; got ndim={block_logit.ndim}"
+        )
+        _nb_min = (k.shape[1] + block_size - 1) // block_size
+        assert block_logit.shape[-1] >= _nb_min, (
+            f"block_logit num_blocks={block_logit.shape[-1]} < ceil(seqlen_k/block_size)={_nb_min}"
+        )
+        block_logit_tensor = from_dlpack(
+            block_logit.detach(), assumed_align=4
+        ).mark_layout_dynamic(leading_dim=block_logit.ndim - 1)
+    else:
+        block_logit_tensor = None
+
+    # Optional per-query document start (bos) for DOCUMENT-relative block
+    # bucketing (pack-equivalence). Without it the kernel buckets by absolute
+    # packed-sequence block, which is only correct for single-document (bos==0)
+    # inputs. Shape [B, S] int32, aligned with block_logit's query dim.
+    if block_bos is not None:
+        assert block_logit is not None, (
+            "block_bos requires block_logit (it drives its relative bucketing)"
+        )
+        assert block_bos.dtype == paddle.int32, (
+            f"block_bos must be int32; got {block_bos.dtype}"
+        )
+        assert block_bos.place.is_gpu_place(), "block_bos must be on CUDA"
+        assert block_bos.ndim == 2, (
+            f"block_bos must be [B, S]; got ndim={block_bos.ndim}"
+        )
+        assert list(block_bos.shape) == [batch_size, seqlen_q], (
+            f"block_bos must be [B={batch_size}, S={seqlen_q}]; got {block_bos.shape}"
+        )
+        block_bos_tensor = from_dlpack(
+            block_bos.detach(), assumed_align=4
+        ).mark_layout_dynamic(leading_dim=block_bos.ndim - 1)
+    else:
+        block_bos_tensor = None
+
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
@@ -748,6 +821,15 @@ def _flash_attn_fwd(
     if aux_tensors is not None:
         cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors]
 
+    # Trailing positional args after ``cute_flashmask_info`` differ per SM:
+    # only the SM100 forward accepts the HySparse block-score tensors
+    # (mBlockLogit, mBlockBos); both SM90 and SM100 take ``stream`` last.
+    # Build the tail once so compile-trace and invocation stay in lockstep.
+    if compute_capability == 10:
+        trailing_args = (block_logit_tensor, block_bos_tensor, current_stream)
+    else:
+        trailing_args = (current_stream,)
+
     compile_key = (
         dtype,
         head_dim,
@@ -777,6 +859,9 @@ def _flash_attn_fwd(
         # flashmask
         startend_row_indices.shape[3] if startend_row_indices is not None else None,
         is_split_d if compute_capability == 10 else False,
+        block_logit is None,
+        block_size,
+        block_bos is None,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
@@ -825,6 +910,9 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, 128],
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                 is_split_d=is_split_d,
+                has_block_logit=block_logit is not None,
+                block_size=block_size,
+                has_block_bos=block_bos is not None,
             )
         else:
             raise ValueError(
@@ -850,7 +938,7 @@ def _flash_attn_fwd(
             sparse_tensors,
             cute_aux_tensors,
             cute_flashmask_info,
-            current_stream,
+            *trailing_args,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor,
@@ -870,7 +958,7 @@ def _flash_attn_fwd(
         sparse_tensors,
         cute_aux_tensors,
         cute_flashmask_info,
-        current_stream,
+        *trailing_args,
     )
     if is_split_kv:
         _flash_attn_fwd_combine(
